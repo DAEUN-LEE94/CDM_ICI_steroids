@@ -23,7 +23,7 @@ Cohort definition and database-specific queries for reproducible cohort construc
 
 ### 2️⃣ Concept Sets  
 Clinical concept definitions used for cohort inclusion/exclusion and covariate construction.  
-- `concept sets.docx`
+- [concept sets.docx](./concept%20sets.docx)
 
 ### 3️⃣ Analysis Code (R Markdown)  
 R scripts for data extraction, matching, and outcome estimation.  
