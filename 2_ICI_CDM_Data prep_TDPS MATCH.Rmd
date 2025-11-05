@@ -1,9 +1,4 @@
 
-1. Case/Control definition: ICI & Steroid
-2. Covariates: PS Matching at Cohort Entry (ICI New use)
-3. Index date matching: ICI use cycle in Case/Control
-
-
 ```{r}
 library(dplyr)
 library(lubridate)
@@ -17,21 +12,14 @@ library(Hmisc)
 ```
 
 
-[Steroid concept set 다시 정의하고 생리학적 용량 미만을 다시 정확히 정의해야 하지 않는지...?]
-
-
-
-
-1. Definition of Case & Control
-JOIN: Drug_Exposure Tables of ICI and Steroid
-    환자군정의: ICI 사용개시 이후 연속사용기간 내 스테로이드 병용
-                (+_60일 기준, 120일 collapse, 마지막 사용일 기준 60일까지는 관찰함)
-    대조군정의: ICI 사용개시 이후 연속사용기간 내 스테로이드 미사용 (동일 기준 적용용)
-
+1. Case and control definition
+JOIN: Drug_Exposure tables for ICI and steroids
+    Case definition: steroid exposure during the continuous ICI treatment window
+                     (±60 day rule, 120-day collapsing window, and follow-up up to 60 days after the last ICI date)
+    Control definition: no steroid exposure during the continuous ICI treatment window (same collapsing rule)
+    
 ```{r}
-# knitr::opts_knit$set(root.dir = "C:/ICI_분석 코드 및 데이터")
-setwd("D:/SNUH_OJM")
-# getwd()
+
 ICI <- read.csv("ICI.CSV")[,-1]
 
 patient <- read.csv("patient.CSV")[,-1]
@@ -50,8 +38,8 @@ print(unique(ICI$DRUG_CONCEPT_ID))
 # 36808878	10 ML durvalumab 50 MG/ML Injectable Solution
 
 
-# 1) 환자별 ICI 연속사용기간 정의 (120일 단위 collapse) 
-# ICI 종류
+# 1) Create continuous ICI exposure windows per patient (collapse gaps of 120 days or less)
+# ICI drug categories
 ICI_drug <- ICI %>%
   mutate(
     pembrolizumab = as.integer(DRUG_CONCEPT_ID == 46276413),
@@ -59,7 +47,7 @@ ICI_drug <- ICI %>%
     atezolizumab = as.integer(DRUG_CONCEPT_ID == 42629082),
     durvalumab = as.integer(DRUG_CONCEPT_ID %in% c(36809461, 36808878))
   )
-# 각 환자별로 약제 사용 여부를 1 또는 0으로 집계
+# Summarise ICI drug exposure indicators at the patient level
 ICI_drug <- ICI_drug %>%
   group_by(PERSON_ID) %>%
   summarise(
@@ -71,7 +59,7 @@ ICI_drug <- ICI_drug %>%
   )
 
 
-# collapse 120일 기준 함수 정의
+# Function to collapse exposure periods using a 120-day gap threshold
 calculate_date_diff120 <- function(df) {
   df %>%
     mutate(
@@ -107,7 +95,7 @@ ICI_collapsed <- unique(ICI_collapsed)
 
 
 
-# 2) 연속사용기간+60일 내에 스테로이드 drug_exposure_start_date 행만 필터링
+# 2) Filter steroid exposures occurring within the continuous ICI window plus 60 day
 ICI_steroid <- data.frame()
 
 ICI_collapsed$ICI_START_DATE <- as.Date(ICI_collapsed$ICI_START_DATE)
@@ -183,8 +171,10 @@ Steroid_collapsed_total <- Steroid_collapsed
 
 
 
-# 3) 24.10.02. steroid new use 연속사용 기간 내에 스테로이드 사용 - case / 미사용 - control // 
-### control 에서는 연속사용기간 종료 이후에 다시 ICI+steroid 병용하면 센서링. 
+# 3) (2024-10-02) Identify steroid new use within the continuous ICI window:
+#     case = steroid use, control = no steroid use.
+### For controls, censor if ICI and steroid are used together after the continuous use window ends.
+
 
 
 ICI_steroid <- data.frame()
@@ -272,7 +262,9 @@ patient <- patient %>%
 
 
 
-### 환자당 1개의 ICI 연속사용기간만 남기기 - case는 steroid 사용시점을 기준으로 남기기, control은 가장 빠른 기간만 남기기.
+### Retain a single ICI continuous-use interval per patient
+### Cases: keep the interval that includes the steroid start date; controls: keep the earliest interval.
+
 
 ICI_collapsed_check <- left_join(ICI_collapsed_check, select(patient, PERSON_ID, TARGET), by = "PERSON_ID")
 
@@ -300,7 +292,7 @@ ICI_collapsed_filtered <- ICI_collapsed_filtered %>%
 
 
 
-###24.10.02.=> control 에서는 연속사용기간 종료 이후에 다시 ICI+steroid 병용하면 센서링 => cohort_end_date와 비교해서 더 빠른 날짜로 치환.
+###(2024-10-02) For controls, censor if steroid use resumes after the ICI window by truncating COHORT_END_DATE when Steroid_START_DATE occurs earlier.
 ICI_collapsed_total_filtered <- left_join(ICI_collapsed_total, select(patient, PERSON_ID, TARGET), by = "PERSON_ID")
 
 Steroid_collapsed_total_uniq <- Steroid_collapsed_total %>%
@@ -352,7 +344,7 @@ write.csv(ICI_collapsed_filtered, file = "ICI_collapsed_filtered.CSV")
 
 
 
-#4) 환자별 ICI use cycle & TARGET 군은 가장빠른 steroid START_DATE 이전의 use cycle 산출
+#4)  4) Derive the ICI use cycle per patient and identify the cycle preceding the earliest steroid start date in the case group
 
 ICI_continu <- ICI_continu %>%
   arrange(PERSON_ID, DRUG_EXPOSURE_START_DATE)
@@ -385,7 +377,7 @@ find_latest_record <- function(df, steroid_date) {
   }
   latest_date <- max(valid_dates$DRUG_EXPOSURE_START_DATE, na.rm = TRUE)
   latest_index <- which.max(valid_dates$DRUG_EXPOSURE_START_DATE == latest_date)
-  return(latest_index)  #index로 찾아주는 코드(정렬필요)
+  return(latest_index) 
 }
 
 # Applying the function to the ICI_continu dataset to create the ICI_index_cycle column
@@ -401,7 +393,7 @@ patient <- unique(patient)
 
 
 
-#4) 환자별 ICI use days & TARGET 군은 steroid START_DATE까지의 days 산출
+#4) Calculate cumulative ICI exposure days and, for cases, the number of days until the steroid index date
 ICI_use_days <- select(ICI, PERSON_ID, DRUG_EXPOSURE_END_DATE)
 ICI_use_days <- left_join(ICI_use_days, select(patient, PERSON_ID, COHORT_START_DATE), by = "PERSON_ID")
 ICI_use_days <- unique(ICI_use_days)
@@ -434,8 +426,9 @@ patient <- patient %>%
 
 
 
-#5) 다른 항암제 병용 여부 및 시기
-# chemo
+#5) 5) Capture concomitant anticancer therapy and its timing
+# Chemotherapy
+
 chemo_agent <- read.csv("cancer_agent.CSV")[,-1] 
 
 # TKI_ALK
@@ -469,7 +462,7 @@ write.csv(afterICI_cancer_agent, file = "afterICI_cancer_agent.CSV")
 
 
 
-# TARGET에서 steroid 사용 시작 시점(Index) "시점"에 ICI monotherapy가 아닌 경우 제외
+# Exclude participants who are not on ICI monotherapy at the steroid index date in the TARGET cohort
 patient_mono <- patient %>%
   filter(is.na(other_CA_START_DATE) | is.na(Steroid_index_date) | 
          (other_CA_START_DATE > Steroid_index_date))
@@ -481,8 +474,7 @@ patient_mono <- patient_mono %>%
 
 
 patient_mono <- left_join(patient_mono, ICI_drug, by = 'PERSON_ID')
-#################### 668 -> 552. CASE 347> 231 (116 제외됨.24.10.02.) 
-#### 668 -> 553. CASE 345> 230 (115 제외됨.24.12.) 
+
 
 
 
@@ -493,74 +485,19 @@ patient_mono <- left_join(patient_mono, ICI_drug, by = 'PERSON_ID')
 
 3. Covariates: Data prep for TDPS Matching
 # Time-fixed: before Cohort Entry (ICI New use)
-# Time-dependent: 
-## 환자군: Index_ICI_days 기준 최대 prescrib 정의(1~7)
-## 대조군: ICI_use_days 기준 최대 prescrib 정의
-##  prescrib 숫자+1만큼 아래 코드 순차적으로 실행하는 loop 
-1개월 미만 => 60일 이전 중 가장 entry 날짜에 가까운,(new-use)기준 변수 정의 적용 & FIXED 변수 정의
-1개월 이상~3개월 미만 => entry+30days 이내 가장 +30days에 가까운
-3개월 이상~6개월 미만 => entry+30 ~ 90days 이내 가장 +90days에 가까운
-6개월 이상~1년 미만 => entry+90 ~ 180days 이내 가장 +180days에 가까운
-1년 이상~2년 미만 => entry+180 ~ 365days 이내 가장 +360days에 가까운
-2년 이상~3년 미만 => entry+365 ~ 730days 이내 가장 +730days에 가까운
-3년 이상 => 수집하지 않음.
+# Time-dependent covariates:
+## Cases: evaluate prescriptions using Index_ICI_days (maximum of 1 to 7 windows)
+## Controls: evaluate prescriptions using ICI_use_days (same window definition)
+## For each prescription window count, iterate through the loop below
 
-
-
-## 기저 steroid 사용, 기저 chemo & TKI_ALK 사용 여부 공변량으로 추가하기!!!!!!!!!!!!!!!
 
 ```{r}
-
-comorbd_disease <- read.csv("comorbd_disease.CSV")[,-1]
-concom_drug2 <- read.csv("concom_drug2.CSV")[,-1]
-sepsis <- read.csv("sepsis.CSV")[,-1]
-
-###24.10.02.컨셉추가
-irAE_total <- read.csv("irAE_total.CSV")[,-1] # covariates 24.10.02.
-# demographics
-dyspnea <- read.csv("dyspnea.CSV")[,-1]
-pneumonitis <- read.csv("pneumonitis.CSV")[,-1]
-Cardiomyopathy <- read.csv("Cardiomyopathy.CSV")[,-1]#미사용24.10.02.
-Dermatotx <- read.csv("Dermatotx.CSV")[,-1]#미사용24.10.02.
-Thyrotoxicosis <- read.csv("Thyrotoxicosis.CSV")[,-1]#미사용24.10.02.
-pancrea_soma_heptitis <- read.csv("pancrea_soma_heptitis.CSV")[,-1]#미사용24.10.02.
-
-sexbirth <- read.csv("sexbirth.CSV")[,-1]
-CBC_lab <- read.csv("CBC_lab.CSV")[,-1]
-cytokeratin <- read.csv("cytokeratin.CSV")[,-1]
-autoimmunedz <- read.csv("autoimmunedz.CSV")[,-1]
-height <- read.csv("height.CSV")[,-1]
-weight <- read.csv("weight.CSV")[,-1]
-
-###24.10.02.컨셉추가
-## CSC_sum
-CSC_RT_GKS <- read.csv("CSC_RT_GKS.CSV")[,-1] ## covariates 24.10.02.
-CSC_condition <- read.csv("CSC_condition.CSV")[,-1]
-metastasis_all <- read.csv("metastasis_all.CSV")[,-1] ## covariates 24.10.02.
-cancer_regist <- read.csv("cancer_regist.CSV")[,-1] # covariates 24.10.02.
-cancer_reg_final <- read.csv("cancer_reg_final.CSV")[,-1] # covariates 24.10.02.
-
-# demographics
-bonemeta <- read.csv("bonemeta.CSV")[,-1]
-brainmeta <- read.csv("brainmeta.CSV")[,-1]
-livermeta <- read.csv("livermeta.CSV")[,-1]
-
-cancer_lung_sq <- read.csv("cancer_lung_sq.CSV")[,-1] ## covariates,demo 24.10.02.
-cancer_lung <- read.csv("cancer_lung.CSV")[,-1] #미사용24.10.02.
-cancer_primary <- read.csv("cancer_primary.CSV")[,-1] #미사용24.10.02.
-TNM <- read.csv("TNM.CSV")[,-1] #미사용24.10.02.
-
-
-
-
-
-
 
 #1) FIXED data prep------------------------------------------------------------------------------------------------
 
 #1-1) SEX / AGE
-# 8532: 여자
-# 8507: 남자
+# 8532: Female
+# 8507: Male
 sexbirth_c <- left_join(sexbirth, select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by = "PERSON_ID")
 sexbirth_c <- sexbirth_c %>%
   mutate(
@@ -574,7 +511,7 @@ sexbirth_c <- sexbirth_c %>%
     sex = case_when(
       GENDER_CONCEPT_ID == 8507 ~ "M",
       GENDER_CONCEPT_ID == 8532 ~ "F",
-      TRUE ~ NA_character_  # GENDER_CONCEPT_ID가 이 외의 값인 경우 NA로 설정
+      TRUE ~ NA_character_  # Assign NA when GENDER_CONCEPT_ID is not mapped to male or female
     )
   )
 sexbirth_c <- sexbirth_c %>%
@@ -586,13 +523,10 @@ patient_mono <- left_join(patient_mono, select(sexbirth_c, PERSON_ID, age, sex),
 
 patient_mono <- left_join(patient_mono, autoimmunedz, by = 'PERSON_ID')
 
-# comorbd_disease <- select(comorbd_disease,-c(CAD, HYPERTENSION))
 patient_mono <- left_join(patient_mono, comorbd_disease, by = 'PERSON_ID')
 
 
 
-
-# concom_drug2 <- select(concom_drug2, -c(TOPICAL_STEROID, HYPOGLYCEMIC, HYPOLIPID))
 concom_drug <- left_join(select(patient_mono, PERSON_ID), concom_drug2, by = 'PERSON_ID')
 concom_drug <- concom_drug %>%
   mutate(across(everything(), ~replace_na(., 0)))
@@ -601,7 +535,7 @@ patient_mono <- left_join(patient_mono, concom_drug, by = 'PERSON_ID')
 
 
 
-cancer_lung_sq <- read.csv("cancer_lung_sq.CSV")[,-1] ## covariates,demo 24.10.02.
+cancer_lung_sq <- read.csv("cancer_lung_sq.CSV")[,-1] 
 patient_mono <- patient_mono %>%
   mutate(squamouslc = ifelse(PERSON_ID %in% cancer_lung_sq$PERSON_ID, 1, 0))
 
@@ -634,8 +568,6 @@ pre_steroid <- pre_steroid %>%
   mutate(across(everything(), ~replace_na(., 0)))
 
 patient_mono <- left_join(patient_mono, pre_steroid, by = 'PERSON_ID')                      
-# patient_CSAI_mono <- left_join(patient_CSAI_mono, pre_steroid, by = 'PERSON_ID')
-# patient_CSC_mono <- left_join(patient_CSC_mono, pre_steroid, by = 'PERSON_ID')
 
 
 
@@ -666,8 +598,6 @@ pre_chemo <- pre_chemo %>%
   mutate(across(everything(), ~replace_na(., 0)))
 
 patient_mono <- left_join(patient_mono, pre_chemo, by = 'PERSON_ID')                      
-# patient_CSAI_mono <- left_join(patient_CSAI_mono, pre_chemo, by = 'PERSON_ID')
-# patient_CSC_mono <- left_join(patient_CSC_mono, pre_chemo, by = 'PERSON_ID')
 
 
 
@@ -695,8 +625,6 @@ pre_TKI_ALK <- pre_TKI_ALK %>%
   mutate(across(everything(), ~replace_na(., 0)))
 
 patient_mono <- left_join(patient_mono, pre_TKI_ALK, by = 'PERSON_ID')                      
-# patient_CSAI_mono <- left_join(patient_CSAI_mono, pre_TKI_ALK, by = 'PERSON_ID')
-# patient_CSC_mono <- left_join(patient_CSC_mono, pre_TKI_ALK, by = 'PERSON_ID')
 
 
 
@@ -724,25 +652,6 @@ patient_mono <- patient_mono %>%
 #2) Time-dependent data prep-------------------------------------------------------------------------
 
 #2-1)
-# ## 환자군: Index_ICI_days 기준 최대 prescrib 정의(1~7)
-# ## 대조군: ICI_use_days 기준 최대 prescrib 정의
-
-
-#### 2024.07.16.prescrib 정의를 2년까지로 제한하고 세분화함, ICI개시 2년 이후 steroid 사용은 제외
-#       TARGET == 1 & Index_ICI_days < 30 ~ 1,
-#       TARGET == 1 & Index_ICI_days >= 30 & Index_ICI_days < 60 ~ 2,
-#       TARGET == 1 & Index_ICI_days >= 60 & Index_ICI_days < 120 ~ 3,
-#       TARGET == 1 & Index_ICI_days >= 120 & Index_ICI_days < 180 ~ 4,
-#       TARGET == 1 & Index_ICI_days >= 180 & Index_ICI_days < 270 ~ 5,
-#       TARGET == 1 & Index_ICI_days >= 270 & Index_ICI_days < 365 ~ 6,
-#       TARGET == 1 & Index_ICI_days >= 365 & Index_ICI_days < 545 ~ 7,
-#       TARGET == 1 & Index_ICI_days >= 545 & Index_ICI_days < 730 ~ 8,
-#       TARGET == 1 & Index_ICI_days >= 730 ~ 9,
-#       TARGET == 0 & ICI_use_days < 30 ~ 1,
-
-
-
-
 
 patient_mono <- patient_mono %>%
   mutate(
@@ -754,7 +663,6 @@ patient_mono <- patient_mono %>%
       TARGET == 1 & Index_ICI_days >= 180 & Index_ICI_days < 270 ~ 5,
       TARGET == 1 & Index_ICI_days >= 270 & Index_ICI_days < 365 ~ 6,
       TARGET == 1 & Index_ICI_days >= 365 & Index_ICI_days < 545 ~ 7,
-      # 24.12. 변경 -> 730 관찰기간 + 60일 window 고려해서 790일까지를 8로 부여
       TARGET == 1 & Index_ICI_days >= 545 & Index_ICI_days < 790 ~ 8,
       TARGET == 1 & Index_ICI_days >= 790 ~ 9))
 
@@ -797,34 +705,16 @@ patient_mono <- patient_mono %>%
 patient_mono_time <- patient_mono %>%
   uncount(weights = ICI_prescrib_TDPS, .remove = FALSE)  
 
-# 이전버전 코드-돌리지 말것
-# patient_mono_time <- patient_mono_time %>%
-#   mutate(ad_steroid = if_else(TARGET == 1, ICI_prescrib_TDPS, NA))
-
 
 patient_mono_time <- patient_mono_time %>%
   group_by(PERSON_ID) %>%  
-  mutate(ICI_prescrib_TDPS = row_number()) %>%  # 각 그룹 내에서 행 번호를 새롭게 할당
+  mutate(ICI_prescrib_TDPS = row_number()) %>% 
   ungroup() 
 
 
 
 
 #2-2)
-# ##  prescrib 숫자+1만큼 아래 코드 순차적으로 실행하는 loop 
-# 1> 1개월 미만 => 이전 가장 entry 날짜에 가까운,(new-use)기준 변수 정의 적용 & FIXED 변수 정의
-# 2> 1개월 이상~3개월 미만 => entry+30days 이내 가장 +30days에 가까운
-# 3> 3개월 이상~6개월 미만 => entry+30 ~ 90days 이내 가장 +90days에 가까운
-#       TARGET == 1 & Index_ICI_days < 30 ~ 1,
-#       TARGET == 1 & Index_ICI_days >= 30 & Index_ICI_days < 60 ~ 2,
-#       TARGET == 1 & Index_ICI_days >= 60 & Index_ICI_days < 120 ~ 3,
-#       TARGET == 1 & Index_ICI_days >= 120 & Index_ICI_days < 180 ~ 4,
-#       TARGET == 1 & Index_ICI_days >= 180 & Index_ICI_days < 270 ~ 5,
-#       TARGET == 1 & Index_ICI_days >= 270 & Index_ICI_days < 365 ~ 6,
-#       TARGET == 1 & Index_ICI_days >= 365 & Index_ICI_days < 545 ~ 7,
-#       TARGET == 1 & Index_ICI_days >= 545 & Index_ICI_days < 730 ~ 8,
-#       TARGET == 1 & Index_ICI_days >= 730 ~ 9,
-#       TARGET == 0 & ICI_use_days < 30 ~ 1,
 
 
 ###
@@ -1064,7 +954,6 @@ brainmeta <- brainmeta %>%
 
 brainmeta <- brainmeta %>%
   group_by(PERSON_ID, brainmeta_occur) %>%
-  # filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
   filter(CONDITION_START_DATE == min(CONDITION_START_DATE)) %>%
   ungroup()
 
@@ -1120,7 +1009,6 @@ bonemeta <- bonemeta %>%
 
 bonemeta <- bonemeta %>%
   group_by(PERSON_ID, bonemeta_occur) %>%
-  # filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
   filter(CONDITION_START_DATE == min(CONDITION_START_DATE)) %>%
   ungroup()
 
@@ -1175,7 +1063,6 @@ livermeta <- livermeta %>%
 
 livermeta <- livermeta %>%
   group_by(PERSON_ID, livermeta_occur) %>%
-  # filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
   filter(CONDITION_START_DATE == min(CONDITION_START_DATE)) %>%
   ungroup()
 
@@ -1201,9 +1088,7 @@ patient_mono_time <- select(patient_mono_time, -livermeta_occur)
 
 
 
-# 암 등록 자료 & metastasis_all integration (2024.10.04.)
-### covariate으로 전이여부만 판정
-####>> 진단코드로 정의불가해서 포기(2024.10.) outcome 정의: 암 등록 자료 및 entry_date(ICI 첫 사용 시작, cohort_start_date) 1년 전까지는 없었던 "새로운 전이" detection
+# Cancer registry and metastasis_all integratio
 cancer_reg <- cancer_reg_final[,-(2:4)]
 colnames(cancer_reg)
 cancer_reg <- unique(cancer_reg)
@@ -1256,9 +1141,9 @@ metastasis_kcd <- metastasis_kcd %>%
   mutate(meta_source = substr(ext_cond_source_value_kcd, 1, 4))
 metastasis_kcd <- metastasis_kcd[,-(2:3)]
 metastasis_kcd <- unique(metastasis_kcd)
-#### --------------------metastasis_kcd와 암등록자료의 metacode KCD가 모두 겹치지 않음을 확인 (24.10.04.)
 
-## M1a~b에 해당하는 전이
+
+## Metastases corresponding to M1a~b
 # 254591	94391008	Secondary malignant neoplasm of lung
 # 72266	94493005	Secondary malignant neoplasm of pleura
 # 4248199	94484009	Secondary malignant neoplasm of pericardium
@@ -1266,7 +1151,6 @@ metastasis_kcd <- unique(metastasis_kcd)
 # 4248061	94352003	Secondary malignant neoplasm of intrathoracic organs
 # 4312284	94233006	Secondary malignant neoplasm of bronchus
 
-## M1c1,c2에 해당하는 전이: 그 외
 
 
 
@@ -1276,21 +1160,15 @@ cancer_primary <- cancer_primary %>%
   group_by(PERSON_ID, CONDITION_CONCEPT_ID) %>%
   slice_min(CONDITION_START_DATE) %>%
   ungroup()
-#### lung cancer 이외에는 모두 제외되었음을 확인 (2024.10.04.)
+#### Confirmed that all non-lung primary cancers were excluded
 
 
 
 
-## 2024.10.04. "NEW" metastasis outcome dataset: "metastasis_all"을 사용 => concept_id 별로 가장 빠른 날짜 기준으로 index date와 비교.
-##(3의 outcome 코드에서 처리)
+##Use the "metastasis_all" dataset for the new metastasis outcome; compare the earliest date per concept_id with the index date.
 
 
 
-
-
-
-
-#metastasis "COVARIATES" 24.10.02.
 metastasis_all  <- left_join(metastasis_all , select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
 
 
@@ -1322,7 +1200,6 @@ metastasis <- metastasis %>%
 
 metastasis <- metastasis %>%
   group_by(PERSON_ID, metastasis_occur) %>%
-  # filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
   filter(CONDITION_START_DATE == min(CONDITION_START_DATE)) %>%
   ungroup()
 
@@ -1336,7 +1213,7 @@ metastasis <- metastasis %>%
 
 metastasis <- na.omit(metastasis, subset = "metastasis_occur")
 
-#24.10.04. Metastasis 보강 - 암등록자료
+
 metastasis <- left_join(metastasis, select(cancer_reg, PERSON_ID, reg_meta_history), by = "PERSON_ID")
 metastasis <- metastasis %>%
   mutate(metastasis_occur_new = metastasis_occur)
@@ -1722,8 +1599,8 @@ ICI_period <- ICI_period %>%
     next_start_date = lead(DRUG_EXPOSURE_START_DATE),
     days_between = if_else(
       is.na(next_start_date), 
-      NA_real_,  # 직접적으로 numeric NA를 사용
-      as.numeric(next_start_date - DRUG_EXPOSURE_END_DATE)  # 차이 계산 후 numeric으로 변환
+      NA_real_, 
+      as.numeric(next_start_date - DRUG_EXPOSURE_END_DATE)
     ),
     gap_over_60 = if_else(!is.na(days_between) & days_between >= 60 & days_between < 120, TRUE, FALSE)
   ) %>%
@@ -1792,7 +1669,7 @@ patient_mono_time <- patient_mono_time %>%
 
 
 
-# irAE covariates 추가 241002
+# irAE covariates 
 irAE_total <- left_join(irAE_total, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
 irAE <- irAE_total %>%
   group_by(PERSON_ID) %>%
@@ -1838,7 +1715,7 @@ patient_mono_time <- select(patient_mono_time, -irAE_occur)
 
 
 
-##250318 15일 이전 입원여부
+##Hospitalization within 15 days prior
 admission_raw <- read.csv("addmission.CSV")[,-1]
 ER_raw <- read.csv("ER.CSV")[,-1]
 
@@ -1916,15 +1793,14 @@ Time-dependent PS matching
 
 ```{r}
 
-#----------------------BMI / ANC / NLR / cytokeratin 범주형으로 변환할 것인지?
 
 
-# 결측치 30% 이상인 변수 제외 
+# Exclude variables with >30% missingness
 missing_percentages <- colSums(is.na(patient_mono_time)) / nrow(patient_mono_time) * 100
 print(missing_percentages)
 
 
-#NA 처리 imputation
+#imputation
 patient_mono_time <- patient_mono_time %>%
   group_by(PERSON_ID) %>%
   mutate(ANC_lab = ifelse(is.na(ANC_lab), mean(ANC_lab, na.rm = TRUE), ANC_lab),
@@ -1940,7 +1816,6 @@ patient_mono_time <- patient_mono_time %>%
 
 
 
-# ANC, NLR 범주형 처리
 patient_mono_time <- patient_mono_time %>%
   mutate(ANC_category = case_when(
     ANC_lab < 1500 ~ 1,
@@ -1948,7 +1823,6 @@ patient_mono_time <- patient_mono_time %>%
     ANC_lab > 8000 ~ 3
   ))
 
-# NLR_cal 범주화
 patient_mono_time <- patient_mono_time %>%
   mutate(NLR_category = case_when(
     NLR_cal < 3 ~ 1,
@@ -1972,10 +1846,6 @@ colnames(patient_mono_time_8)
 patient_mono_time_ps <- select(patient_mono_time_8, PERSON_ID, ICI_prescrib_TDPS, ad_steroid, age, sex, squamouslc, durvalumab_use, ANC_category, NLR_category, AUTOIMMUNE, LIVER_INSUFFICIENCY, RENAL_INSUFFICIENCY, COPD, metastasis, RT_GKS, pre_chemo, pre_TKI_ALK, pre_steroid, ANTI_BIOTICS, NSAID, PPI, ACEI, OPIOID, irAE, Sepsis, hospital_sever)
 
 
-
-# install.packages("rsmatch")
-# install.packages("survival")
-# install.packages("nbpMatching")
 library("rsmatch")
 library("survival")
 library("nbpMatching")
@@ -2037,7 +1907,7 @@ patient_mono_time_ps <- patient_mono_time_ps %>%
 
 
 # pair-wise exclusion
-# 1) index_date가 매칭되지 않는 경우 삭제
+#  1) Drop records where the index_date cannot be matched
 exclusion_rows <- patient_mono_time_ps %>%
   filter(index_fu == "Exclusion")
 print(exclusion_rows)
@@ -2048,7 +1918,7 @@ check <- patient_mono_time_ps %>%
 print(check)
 
 
-# 2) 새롭게 Index "시점"에 ICI monotherapy가 아닌 경우 제외
+# 2) Exclude participants who are not on ICI monotherapy at the new index date
 invalid_pair_ids <- patient_mono_time_ps %>%
   filter(other_CA_START_DATE <= index_fu) %>%
   pull(pair_id)
@@ -2074,7 +1944,7 @@ write.csv(patient_mono_time_ps_pex, file = "patient_mono_time_pex_sens_sever_250
 library("tableone")
 
 
-#---------------------------------------------누적 변수로 변경 Dyspnea, Radiotherapy, Whole_Brain_RT, RTsurgery, gap_over_60
+#---------------------------------------------Convert to cumulative variables: Dyspnea, Radiotherapy, Whole_Brain_RT, RTsurgery, gap_over_60
 
 
 patient_mono_time_ps_demo <- patient_mono_time_ps_pex
@@ -2178,44 +2048,6 @@ write.csv(table2, file = "table2_sens_sever.CSV")
 
 
 ```
-
-
-
-
-## 2024.10.04. PSM 결과 확인
-```{r}
-
-table2_clean <- read.csv("table2_clean_final.CSV")
-
-
-calculate_smd <- function(data, var_name, group_name){
-  TARGET <- data[[var_name]][data[[group_name]]==1]
-  CONTROL <- data[[var_name]][data[[group_name]]==0]
-  
-  mean_target <- mean(TARGET, na.rm = TRUE)
-  mean_control <- mean(CONTROL, na.rm = TRUE)
-  sd_target <- sd(TARGET, na.rm = TRUE)
-  sd_control <- sd(CONTROL, na.rm = TRUE)
-  smd <- (mean_target - mean_control)/ sqrt((sd_target^2+sd_control^2)/2)
-  return(smd)
-}
-
-str(patient_mono_time_ps_demo)
-patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
-  mutate(sex = ifelse(sex == "M", 1, ifelse(sex == "F", 0, NA)))
-
-smd_vars <- ls(pattern = "^smd_")
-smd_list <- mget(smd_vars)
-smd_df <- data.frame(variable = smd_vars, value = unlist(smd_list))
-
-
-write.csv(smd_df, file = "smd_final_PSM_sens_sever_250318.CSV")
-
-
-
-
-```
-
 
 
 
