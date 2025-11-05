@@ -1,0 +1,1498 @@
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+
+
+setwd("D:/SNUH_OJM")
+
+
+patient_mono_time_ps_demo <- read.csv("patient_mono_time_ps_demo_sens_sever_250318.CSV")[,-1]
+
+#1. primary outcome: OS
+death <- read.csv("death.CSV")[,-1]
+statis_death <- read.csv("statistic_death_20250205.CSV")
+
+#2. secondary outcome: MFS = death or metastasis(NEW)
+metastasis_all <- read.csv("metastasis_all.CSV")[,-1]
+
+#3. secondary outcome: TTNT
+afterICI_cancer_agent <- read.csv("afterICI_cancer_agent.CSV")[,-1]
+ICI_collapsed_filtered <- read.csv("ICI_collapsed_filtered.CSV")[,-1]
+
+#4. secondary: safety - 입원응급
+admission <- read.csv("addmission.CSV")[,-1]
+ER <- read.csv("ER.CSV")[,-1]
+
+```
+
+
+
+#1) primary outcome: OS
+
+```{r}
+# 통계청 사망자료 연계 (2025.02.06.)
+
+statis_death <- statis_death 
+statis_death$DEATH_DATE_ST <- as.Date(paste(statis_death$사망년, statis_death$사망월, statis_death$사망일, sep = "-"),
+                                      format = "%Y-%m-%d")
+unique(statis_death$사망원인1)
+#  [1] ""        "C34"     "C43"     "I63"     "C64"     "I61"     "C22"     "J18"     "U07"     "C65"     "R99"     "S00-T98" "C11"    
+# [14] "C80"     "C02"     "C83"     "C56"     "A00-B99" "C55"     "C49"     "C37"     "I48"     "C45"     "C25"     "C71"     "R68"    
+# [27] "K26" 
+# C 암, I 순환기(특히 뇌), J/AB감염, U 코로나, R general weak, K 십이지장궤양-암, 
+# S00-T98 => 3건 제외함. 사고등
+
+statis_death <- select(statis_death, person_id, 사망원인1, DEATH_DATE_ST)
+colnames(statis_death) <- c("PERSON_ID", "death_cause", "DEATH_DATE_ST")
+statis_death <- statis_death %>%
+  filter(death_cause != "S00-T98")
+
+death_total <- left_join(death, statis_death, by = "PERSON_ID")
+
+death_total$DEATH_DATE <- as.Date(death_total$DEATH_DATE)
+death_total$DEATH_DATE_ST <- as.Date(death_total$DEATH_DATE_ST)
+death_total <- death_total %>%
+  mutate(DEATH_DATE_total = pmin(DEATH_DATE, DEATH_DATE_ST, na.rm = TRUE))
+
+
+death_summary <- death_total %>%
+  group_by(death_cause) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+sum(!is.na(death_total$DEATH_DATE_total))
+
+
+write.csv(death_summary, "death_summary")
+
+death <- select(death_total, PERSON_ID, DEATH_DATE_total)
+colnames(death) <- c("PERSON_ID", "DEATH_DATE")
+
+```
+
+
+
+```{r}
+
+# Death
+#----- follow-up period: 2 years
+
+death_censor <- death %>%
+  left_join(select(patient_mono_time_ps_demo, PERSON_ID, index_fu), by = "PERSON_ID") %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    DEATH_DATE = as.Date(DEATH_DATE),
+    index_fu = as.Date(index_fu),
+    cutoff_date = pmin(index_fu + 730, as.Date("2023-12-31"))
+  ) %>%
+  filter(DEATH_DATE > cutoff_date) %>%
+  ungroup()
+
+death <- unique(death)
+
+death <- death %>%
+  mutate(DEATH_DATE = ifelse(PERSON_ID %in% death_censor$PERSON_ID, NA, DEATH_DATE))
+
+death <- death %>%
+  mutate(
+    DEATH = if_else(is.na(DEATH_DATE), 0, 1),
+    death_censor = if_else(is.na(DEATH_DATE), 1, 0)
+  )
+
+
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(death, PERSON_ID, DEATH_DATE, DEATH, death_censor), by = 'PERSON_ID')
+
+# survival days
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(
+    death_survival_days = if_else(
+      !is.na(DEATH_DATE),
+      as.integer(as.Date(DEATH_DATE) - as.Date(index_fu)) + 1,
+      as.integer(as.Date(COHORT_END_DATE) - as.Date(index_fu)) + 1
+    )
+  )
+
+check <- select(patient_mono_time_ps_demo, PERSON_ID, pair_id, type, COHORT_START_DATE, Steroid_index_date, Index_ICI_days, ad_steroid, ICI_prescrib, ICI_prescrib_TDPS, timeseries_index, index_fu, COHORT_END_DATE, DEATH_DATE, death_survival_days)
+
+
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(
+    death_survival_days = if_else(death_survival_days > 730, 730, death_survival_days)
+  )
+
+
+
+# Index matching 이전에 관찰이 종료된 사람 pair-wise 제외
+Pair_exclusion <- subset(patient_mono_time_ps_demo, death_survival_days < 0)
+Pair_exclusion <- unique(Pair_exclusion$pair_id)
+
+
+patient_mono_time_ps_demo <- subset(patient_mono_time_ps_demo, !(pair_id %in% Pair_exclusion))
+
+
+
+
+# Incidence
+death_incidence <- patient_mono_time_ps_demo %>%
+  group_by(TARGET) %>%
+  summarise(
+    total = n(),  # 전체 개체 수
+    deaths = sum(DEATH, na.rm = TRUE),
+    incidence_per_1000 = (deaths / total) * 1000 
+  )
+
+print(death_incidence)
+
+
+
+
+# K-M plot
+
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(Population = if_else(TARGET == 1, "Target", "Comparator"))
+
+
+KM_mat <- survfit(Surv(death_survival_days, DEATH) ~ Population, type="kaplan-meier", conf.type="log", data=patient_mono_time_ps_demo)
+(logrank<-survdiff(Surv(death_survival_days, DEATH) ~ Population, data=patient_mono_time_ps_demo))
+
+
+
+
+# Load necessary libraries
+library(grid)
+library(cowplot)
+
+# Extract median survival and confidence intervals for each group
+median_ici <- summary(KM_mat)$table["Population=Comparator", "median"]
+ci_ici_lower <- summary(KM_mat)$table["Population=Comparator", "0.95LCL"]
+ci_ici_upper <- summary(KM_mat)$table["Population=Comparator", "0.95UCL"]
+
+median_ici_steroid <- summary(KM_mat)$table["Population=Target", "median"]
+ci_ici_steroid_lower <- summary(KM_mat)$table["Population=Target", "0.95LCL"]
+ci_ici_steroid_upper <- summary(KM_mat)$table["Population=Target", "0.95UCL"]
+
+
+two_year_survival <- summary(KM_mat, times = 730)
+print(two_year_survival)
+
+
+# Kaplan-Meier plot and risk table
+ggsurv <- ggsurvplot(
+  KM_mat, data = patient_mono_time_ps_demo,
+  pval = TRUE, conf.int = TRUE,
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.height = 0.25,
+  ggtheme = theme_minimal(),
+  legend.title = "Strata",
+  legend.labs = c("ICI", "ICI+Steroid"),
+  palette = c("#FA6C00", "#0000CD"),
+  linetype = c("dashed", "solid"),
+  pval.coord = c(120, 0.1),
+  break.time.by = 100,
+  risk.table.breaks = seq(0, 730, by = 100), # 리스크 테이블을 100일 간격으로 설정
+  xlim = c(0, 730) # x축 최대값을 1095로 설정
+)
+
+# Add labels for median survival and confidence intervals
+median_text_ici <- paste("Median:", round(median_ici, 1),
+                         "days (95% CI:", round(ci_ici_lower, 1), "-",
+                         round(ci_ici_upper, 1), ")")
+median_text_ici_steroid <- paste("Median:", round(median_ici_steroid, 1),
+                                 "days (95% CI:", round(ci_ici_steroid_lower, 1), "-",
+                                 round(ci_ici_steroid_upper, 1), ")")
+
+
+ggsurv$plot <- ggsurv$plot +
+  labs(
+    title = "Kaplan-Meier Survival Estimates: Death",
+    x = "Time in days",
+    y = "Event-free Survival Probability"
+  ) +
+  annotate("segment", x = median_ici, xend = median_ici,
+           y = 0, yend = 0.5, linetype = "dashed", color = "#FA6C00") +
+  annotate("text", x = median_ici + 15, y = 0.55,
+           label = median_text_ici, color = "#FA6C00", vjust = -1, hjust = 0, size = 5) +
+  annotate("segment", x = median_ici_steroid, xend = median_ici_steroid,
+           y = 0, yend = 0.5, linetype = "solid", color = "#0000CD") +
+  annotate("text", x = median_ici_steroid + 15, y = 0.50,
+           label = median_text_ici_steroid, color = "#0000CD", vjust = -1, hjust = 0, size = 5) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_text(vjust = -0.2),
+    axis.title.y = element_text(vjust = 5, hjust = 0.5),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_line(color = "grey95"),
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  ) +
+  coord_cartesian(xlim = c(0, 730))
+
+# Align the KM plot and risk table using cowplot
+km_plot <- ggsurv$plot
+risk_table <- ggsurv$table + theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+# Combine plots with aligned width
+combined_plot <- plot_grid(
+  km_plot, risk_table,
+  align = "v", ncol = 1, rel_heights = c(3, 1)
+)
+
+
+pdf("KM_death_PSM_combined_sev_250321.pdf", width = 13, height = 12)
+print(ggsurv)
+dev.off()
+
+
+
+# censoring 점검하는 코드
+censoring_data <- patient_mono_time_ps_demo %>%
+  filter(DEATH == 0)
+
+# 검열 지점 플롯
+censoring_plot <- ggplot(censoring_data, aes(x = death_survival_days, color = Population)) +
+  geom_point(aes(y = -20), shape = '|', size = 4) +
+  facet_wrap(~Population, scales = "free_x") +
+  scale_color_manual(name = "Population", values = c("ICI" = "#E7A100", "ICI+Steroid" = "#3E9FDB")) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_blank(), # y축 제목 제거
+    axis.text.y = element_blank(),  # y축 텍스트 제거
+    axis.ticks.y = element_blank(), # y축 눈금 제거
+    panel.grid.major = element_line(color = "grey90"), # 주요 그리드 라인 연하게
+    panel.grid.minor = element_line(color = "grey95")  # 보조 그리드 라인 더 연하게
+  ) +
+  labs(x = "Follow-up (days)", y = "Censoring", title = "Censoring Points")
+
+print(censoring_plot)
+
+
+
+
+```
+
+
+#2) secondary outcome: PFS = meta + chemo + ICI_stop
+
+```{r}
+
+# PFS
+
+# meta data 전처리
+metastasis <- metastasis_all %>%
+  group_by(PERSON_ID, CONDITION_CONCEPT_ID) %>%
+  dplyr::summarize(new_meta_date = min(CONDITION_START_DATE, na.rm = TRUE), .groups = "drop")
+
+
+metastasis <- left_join(
+  select(patient_mono_time_ps_demo, PERSON_ID, index_fu),
+  metastasis,
+  by = 'PERSON_ID'
+)
+
+# 경고 발생 무시해도 됨.
+meta <- metastasis %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    META_DATE = min(if_else(new_meta_date >= index_fu, new_meta_date, NA))
+  ) %>%
+  ungroup()
+
+meta <- select(meta, PERSON_ID, index_fu, META_DATE)
+meta <- unique(meta)
+
+# 관찰기간 내로 자르기: index date(ICI 사용개시) 이후 2년, 2021년에 들어온사람은 2년. 
+meta_censor <- meta %>%
+  left_join(select(patient_mono_time_ps_demo, PERSON_ID), by = "PERSON_ID") %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    META_DATE = as.Date(META_DATE),
+    index_fu = as.Date(index_fu),
+    cutoff_date = pmin(index_fu + 730, as.Date("2023-12-31"))
+  ) %>%
+  filter(META_DATE > cutoff_date) %>%
+  ungroup()
+
+
+
+meta <- meta %>%
+  mutate(META_DATE = ifelse(PERSON_ID %in% meta_censor$PERSON_ID, NA, META_DATE))
+
+meta <- meta %>%
+  mutate(
+    METASTASIS = if_else(is.na(META_DATE), 0, 1),
+    meta_censor = if_else(is.na(META_DATE), 1, 0)
+  )
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(meta, PERSON_ID, META_DATE, METASTASIS, meta_censor), by = 'PERSON_ID')
+
+
+### -----------death + metastasis  2024.10.11. 추가 -
+
+meta_death <- left_join(select(patient_mono_time_ps_demo, PERSON_ID), meta, by = 'PERSON_ID')
+meta_death <- left_join(meta_death, death, by = 'PERSON_ID')
+
+# 경고 발생 무시해도 됨.
+meta_death$META_DATE <- as.Date(meta_death$META_DATE)
+meta_death$DEATH_DATE <- as.Date(meta_death$DEATH_DATE)
+
+meta_death <- meta_death %>%
+  mutate(
+    MFS_DATE = case_when(
+      !is.na(META_DATE) & !is.na(DEATH_DATE) ~ pmin(META_DATE, DEATH_DATE, na.rm = TRUE),
+      !is.na(META_DATE) ~ META_DATE,
+      !is.na(DEATH_DATE) ~ DEATH_DATE
+    ))
+
+
+meta_death <- meta_death %>%
+  mutate(
+    MFS = if_else(is.na(MFS_DATE), 0, 1),
+    MFS_censor = if_else(is.na(MFS_DATE), 1, 0)
+  )
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(meta_death, PERSON_ID, MFS_DATE, MFS, MFS_censor), by = 'PERSON_ID')
+
+
+  
+
+####### MFS
+
+# survival days
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(
+    MFS_days = if_else(
+      !is.na(MFS_DATE),
+      as.integer(as.Date(MFS_DATE) - as.Date(index_fu)) + 1,
+      as.integer(as.Date(COHORT_END_DATE) - as.Date(index_fu)) + 1
+    )
+  )
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(
+    MFS_days = if_else(MFS_days > 730, 730, MFS_days),
+    MFS_days = if_else(MFS_days < 0, 0, MFS_days)
+  )
+
+# Incidence
+MFS_incidence <- patient_mono_time_ps_demo %>%
+  group_by(TARGET) %>%
+  summarise(
+    total = n(),  # 전체 개체 수
+    MFS = sum(MFS, na.rm = TRUE),  # 사망한 경우의 수
+    incidence_per_1000 = (MFS / total) * 1000  # 천명당 사망 발생률
+  )
+
+print(MFS_incidence)
+
+
+
+# K-M plot
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(Population = if_else(TARGET == 1, "Target", "Comparator"))
+
+
+KM_mat <- survfit(Surv(MFS_days, MFS) ~ Population, type="kaplan-meier", conf.type="log", data=patient_mono_time_ps_demo)
+(logrank<-survdiff(Surv(MFS_days, MFS) ~ Population, data=patient_mono_time_ps_demo))
+
+
+
+# Extract median survival and confidence intervals for each group
+median_ici <- summary(KM_mat)$table["Population=Comparator", "median"]
+ci_ici_lower <- summary(KM_mat)$table["Population=Comparator", "0.95LCL"]
+ci_ici_upper <- summary(KM_mat)$table["Population=Comparator", "0.95UCL"]
+
+median_ici_steroid <- summary(KM_mat)$table["Population=Target", "median"]
+ci_ici_steroid_lower <- summary(KM_mat)$table["Population=Target", "0.95LCL"]
+ci_ici_steroid_upper <- summary(KM_mat)$table["Population=Target", "0.95UCL"]
+
+
+two_year_survival <- summary(KM_mat, times = 730)
+print(two_year_survival)
+
+
+
+
+# Kaplan-Meier plot and risk table
+ggsurv <- ggsurvplot(
+  KM_mat, data = patient_mono_time_ps_demo,
+  pval = TRUE, conf.int = TRUE,
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.height = 0.25,
+  ggtheme = theme_minimal(),
+  legend.title = "Strata",
+  legend.labs = c("ICI", "ICI+Steroid"),
+  palette = c("#FA6C00", "#0000CD"),
+  linetype = c("dashed", "solid"),
+  pval.coord = c(120, 0.1),
+  break.time.by = 100,
+  risk.table.breaks = seq(0, 730, by = 100), # 리스크 테이블을 100일 간격으로 설정
+  xlim = c(0, 730) # x축 최대값을 1095로 설정
+)
+
+# Add labels for median survival and confidence intervals
+median_text_ici <- paste("Median:", round(median_ici, 1),
+                         "days (95% CI:", round(ci_ici_lower, 1), "-",
+                         round(ci_ici_upper, 1), ")")
+median_text_ici_steroid <- paste("Median:", round(median_ici_steroid, 1),
+                                 "days (95% CI:", round(ci_ici_steroid_lower, 1), "-",
+                                 round(ci_ici_steroid_upper, 1), ")")
+
+
+ggsurv$plot <- ggsurv$plot +
+  labs(
+    title = "Kaplan-Meier Survival Estimates: MFS",
+    x = "Time in days",
+    y = "Event-free Survival Probability"
+  ) +
+  annotate("segment", x = median_ici, xend = median_ici,
+           y = 0, yend = 0.5, linetype = "dashed", color = "#FA6C00") +
+  annotate("text", x = median_ici + 15, y = 0.55,
+           label = median_text_ici, color = "#FA6C00", vjust = -1, hjust = 0, size = 5) +
+  annotate("segment", x = median_ici_steroid, xend = median_ici_steroid,
+           y = 0, yend = 0.5, linetype = "solid", color = "#0000CD") +
+  annotate("text", x = median_ici_steroid + 15, y = 0.50,
+           label = median_text_ici_steroid, color = "#0000CD", vjust = -1, hjust = 0, size = 5) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_text(vjust = -0.2),
+    axis.title.y = element_text(vjust = 5, hjust = 0.5),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_line(color = "grey95"),
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  ) +
+  coord_cartesian(xlim = c(0, 730))
+
+# Align the KM plot and risk table using cowplot
+km_plot <- ggsurv$plot
+risk_table <- ggsurv$table + theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+# Combine plots with aligned width
+combined_plot <- plot_grid(
+  km_plot, risk_table,
+  align = "v", ncol = 1, rel_heights = c(3, 1)
+)
+
+
+pdf("KM_MFS_PSM_combined_sev250321.pdf", width = 13, height = 12)
+print(ggsurv)
+dev.off()
+
+
+
+# censoring 점검하는 코드
+censoring_data <- patient_mono_time_ps_demo %>%
+  filter(MFS == 0)
+
+# 검열 지점 플롯
+censoring_plot <- ggplot(censoring_data, aes(x = MFS_days, color = Population)) +
+  geom_point(aes(y = -20), shape = '|', size = 4) +
+  facet_wrap(~Population, scales = "free_x") +
+  scale_color_manual(name = "Population", values = c("ICI" = "#E7A100", "ICI+Steroid" = "#3E9FDB")) +
+  theme_minimal() +
+  theme(
+    axis.title.y = element_blank(), # y축 제목 제거
+    axis.text.y = element_blank(),  # y축 텍스트 제거
+    axis.ticks.y = element_blank(), # y축 눈금 제거
+    panel.grid.major = element_line(color = "grey90"), # 주요 그리드 라인 연하게
+    panel.grid.minor = element_line(color = "grey95")  # 보조 그리드 라인 더 연하게
+  ) +
+  labs(x = "Follow-up (days)", y = "Censoring", title = "Censoring Points")
+
+print(censoring_plot)
+
+
+
+
+####### TTNT
+ICI_dc <- left_join(select(patient_mono_time_ps_demo, PERSON_ID, index_fu), ICI_collapsed_filtered, by = 'PERSON_ID')
+ICI_dc <- left_join(ICI_dc, afterICI_cancer_agent, by = 'PERSON_ID')
+ICI_dc <- left_join(select(patient_mono_time_ps_demo, PERSON_ID),
+  ICI_dc,
+  by = 'PERSON_ID')
+
+
+
+ICI_dc <- ICI_dc %>%
+  rowwise() %>%
+  mutate(
+    regimen_change = if_else(
+      ICI_END_DATE >= index_fu & !is.na(other_CA_START_DATE),
+      other_CA_START_DATE,
+      NA
+    )
+  ) %>%
+  ungroup()
+
+
+
+ICI_dc_censor <- ICI_dc %>%
+  left_join(select(patient_mono_time_ps_demo, PERSON_ID), by = "PERSON_ID") %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    regimen_change = as.Date(regimen_change),
+    index_fu = as.Date(index_fu),
+    cutoff_date = pmin(index_fu + 730, as.Date("2023-12-31"))
+  ) %>%
+  filter(regimen_change > cutoff_date) %>%
+  ungroup()
+# 2년 7명 센서링됨.
+
+
+print(ICI_dc_censor$PERSON_ID)
+
+
+ICI_dc <- ICI_dc %>%
+  mutate(regimen_change = if_else(PERSON_ID %in% c(2150422, 2076776, 334334, 1796253, 3301103, 3317970, 1553992), NA, regimen_change))
+
+
+ICI_dc <- ICI_dc %>%
+  mutate(
+    ICI_dc_chemo = if_else(is.na(regimen_change), 0, 1),
+    ICI_dc_chemo_censor = if_else(is.na(regimen_change), 1, 0)
+  )
+
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(ICI_dc, PERSON_ID, regimen_change, ICI_dc_chemo, ICI_dc_chemo_censor), by = 'PERSON_ID')
+unique(patient_mono_time_ps_demo)
+
+# survival days
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(
+    change_survival_days = if_else(
+      !is.na(regimen_change),
+      as.integer(as.Date(regimen_change) - as.Date(index_fu)) + 1,
+      as.integer(as.Date(COHORT_END_DATE) - as.Date(index_fu)) + 1
+    )
+  )
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(
+    change_survival_days = if_else(change_survival_days > 730, 730, change_survival_days),
+    change_survival_days = if_else(change_survival_days < 0, 0, change_survival_days)
+  )
+
+
+
+
+# Incidence
+change_incidence <- patient_mono_time_ps_demo %>%
+  group_by(TARGET) %>%
+  summarise(
+    total = n(),  # 전체 개체 수
+    change = sum(ICI_dc_chemo, na.rm = TRUE),  # 사망한 경우의 수
+    incidence_per_1000 = (change / total) * 1000  # 천명당 사망 발생률
+  )
+
+print(change_incidence)
+
+# K-M plot
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(Population = if_else(TARGET == 1, "Target", "Comparator"))
+
+
+KM_mat <- survfit(Surv(change_survival_days, ICI_dc_chemo) ~ Population, type="kaplan-meier", conf.type="log", data=patient_mono_time_ps_demo)
+(logrank<-survdiff(Surv(change_survival_days, ICI_dc_chemo) ~ Population, data=patient_mono_time_ps_demo))
+
+
+# Extract median survival and confidence intervals for each group
+median_ici <- summary(KM_mat)$table["Population=Comparator", "median"]
+ci_ici_lower <- summary(KM_mat)$table["Population=Comparator", "0.95LCL"]
+ci_ici_upper <- summary(KM_mat)$table["Population=Comparator", "0.95UCL"]
+
+median_ici_steroid <- summary(KM_mat)$table["Population=Target", "median"]
+ci_ici_steroid_lower <- summary(KM_mat)$table["Population=Target", "0.95LCL"]
+ci_ici_steroid_upper <- summary(KM_mat)$table["Population=Target", "0.95UCL"]
+
+
+two_year_survival <- summary(KM_mat, times = 730)
+print(two_year_survival)
+
+
+# Kaplan-Meier plot and risk table
+ggsurv <- ggsurvplot(
+  KM_mat, data = patient_mono_time_ps_demo,
+  pval = TRUE, conf.int = TRUE,
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.height = 0.25,
+  ggtheme = theme_minimal(),
+  legend.title = "Strata",
+  legend.labs = c("ICI", "ICI+Steroid"),
+  palette = c("#FA6C00", "#0000CD"),
+  linetype = c("dashed", "solid"),
+  pval.coord = c(120, 0.1),
+  break.time.by = 100,
+  risk.table.breaks = seq(0, 730, by = 100), # 리스크 테이블을 100일 간격으로 설정
+  xlim = c(0, 730) # x축 최대값을 1095로 설정
+)
+
+# Add labels for median survival and confidence intervals
+median_text_ici <- paste("Median:", round(median_ici, 1),
+                         "days (95% CI:", round(ci_ici_lower, 1), "-",
+                         round(ci_ici_upper, 1), ")")
+median_text_ici_steroid <- paste("Median:", round(median_ici_steroid, 1),
+                                 "days (95% CI:", round(ci_ici_steroid_lower, 1), "-",
+                                 round(ci_ici_steroid_upper, 1), ")")
+
+
+ggsurv$plot <- ggsurv$plot +
+  labs(
+    title = "Kaplan-Meier Survival Estimates: TTNT",
+    x = "Time in days",
+    y = "Event-free Survival Probability"
+  ) +
+  annotate("segment", x = median_ici, xend = median_ici,
+           y = 0, yend = 0.5, linetype = "dashed", color = "#FA6C00") +
+  annotate("text", x = median_ici + 15, y = 0.55,
+           label = median_text_ici, color = "#FA6C00", vjust = -1, hjust = 0, size = 5) +
+  annotate("segment", x = median_ici_steroid, xend = median_ici_steroid,
+           y = 0, yend = 0.5, linetype = "solid", color = "#0000CD") +
+  annotate("text", x = median_ici_steroid + 15, y = 0.50,
+           label = median_text_ici_steroid, color = "#0000CD", vjust = -1, hjust = 0, size = 5) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_text(vjust = -0.2),
+    axis.title.y = element_text(vjust = 5, hjust = 0.5),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_line(color = "grey95"),
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  ) +
+  coord_cartesian(xlim = c(0, 730))
+
+# Align the KM plot and risk table using cowplot
+km_plot <- ggsurv$plot
+risk_table <- ggsurv$table + theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+# Combine plots with aligned width
+combined_plot <- plot_grid(
+  km_plot, risk_table,
+  align = "v", ncol = 1, rel_heights = c(3, 1)
+)
+
+
+pdf("KM_TTNT_PSM_combined_sev250321.pdf", width = 13, height = 12)
+print(ggsurv)
+dev.off()
+
+
+
+
+```
+
+
+
+
+
+#3) secondary outcome: safety: ER && admission
+
+```{r}
+
+#-----------ER 전처리 
+
+ER <- select(ER, PERSON_ID, VISIT_START_DATE, VISIT_END_DATE) %>%
+  left_join(select(patient_mono_time_ps_demo, PERSON_ID, index_fu), by = "PERSON_ID") %>%
+  mutate(
+    VISIT_END_DATE = as.Date(VISIT_END_DATE),
+    VISIT_START_DATE = as.Date(VISIT_START_DATE),    
+    index_fu = as.Date(index_fu)
+  ) %>%
+  filter(VISIT_START_DATE >= index_fu)
+
+ER <- ER %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    ERvisit_DATE = min(VISIT_START_DATE), na.rm = TRUE
+  ) %>%
+  ungroup()
+
+ER <- unique(select(ER, PERSON_ID, ERvisit_DATE))
+
+ER_censor <- ER %>%
+  left_join(select(patient_mono_time_ps_demo, PERSON_ID, index_fu), by = "PERSON_ID") %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    ERvisit_DATE = as.Date(ERvisit_DATE), 
+    index_fu = as.Date(index_fu),
+    cutoff_date = pmin(index_fu + 730, as.Date("2023-12-31"))
+  ) %>%
+  filter(ERvisit_DATE > cutoff_date) %>%
+  ungroup()
+
+# 2년 f/u - 총 15명 센서링
+
+ER <- ER %>%
+  mutate(ERvisit_DATE = ifelse(PERSON_ID %in% ER_censor$PERSON_ID, NA, ERvisit_DATE))
+
+ER <- ER %>%
+  mutate(
+    ERvisit = if_else(is.na(ERvisit_DATE), 0, 1),
+    ER_censor = if_else(is.na(ERvisit_DATE), 1, 0)
+  )
+
+ER <- ER %>%
+  mutate(ERvisit_DATE = as.Date(ERvisit_DATE))
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(ER, PERSON_ID, ERvisit_DATE, ERvisit, ER_censor), by = 'PERSON_ID')
+
+
+
+#-----------admission 전처리 # '만' 3일 이상의 입원만 남김
+
+admission <- select(admission, PERSON_ID, VISIT_START_DATE, VISIT_END_DATE) %>%
+  left_join(select(patient_mono_time_ps_demo, PERSON_ID, index_fu), by = "PERSON_ID") %>%
+  mutate(
+    VISIT_END_DATE = as.Date(VISIT_END_DATE),
+    VISIT_START_DATE = as.Date(VISIT_START_DATE),    
+    index_fu = as.Date(index_fu)
+  ) %>%
+  filter(VISIT_START_DATE >= index_fu) %>%
+  filter((as.integer(as.Date(VISIT_END_DATE) - as.Date(VISIT_START_DATE))) >= 3)
+
+admission <- admission %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    adm_DATE = min(VISIT_START_DATE), na.rm = TRUE
+  ) %>%
+  ungroup()
+
+admission <- unique(select(admission, PERSON_ID, adm_DATE))
+
+adm_censor <- admission %>%
+  left_join(select(patient_mono_time_ps_demo, PERSON_ID, index_fu), by = "PERSON_ID") %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    adm_DATE = as.Date(adm_DATE), 
+    index_fu = as.Date(index_fu),
+    cutoff_date = pmin(index_fu + 730, as.Date("2023-12-31"))
+  ) %>%
+  filter(adm_DATE > cutoff_date) %>%
+  ungroup()
+
+# 2년 f/u - 총 6명 센서링
+
+admission <- admission %>%
+  mutate(adm_DATE = ifelse(PERSON_ID %in% adm_censor$PERSON_ID, NA, adm_DATE))
+
+admission <- admission %>%
+  mutate(
+    ADM_visit = if_else(is.na(adm_DATE), 0, 1),
+    ADM_censor = if_else(is.na(adm_DATE), 1, 0)
+  )
+
+admission <- admission %>%
+  mutate(adm_DATE = as.Date(adm_DATE))
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(admission, PERSON_ID, adm_DATE, ADM_visit, ADM_censor), by = 'PERSON_ID')
+
+
+
+####### PFS 데이터셋 
+
+hospitaliz <- full_join(admission, ER, by = 'PERSON_ID')
+hospitaliz <- left_join(select(patient_mono_time_ps_demo, PERSON_ID, index_fu), hospitaliz, by = 'PERSON_ID')
+
+# 경고 발생 무시해도 됨.
+hospitaliz <- hospitaliz %>%
+  rowwise() %>%
+  mutate(
+    hospital_DATE = {
+      min_date <- min(c(
+        if_else(!is.na(adm_DATE) & adm_DATE >= index_fu, adm_DATE, NA),
+        if_else(!is.na(ERvisit_DATE) & ERvisit_DATE >= index_fu, ERvisit_DATE, NA)
+      ), na.rm = TRUE)
+      if (is.infinite(min_date)) NA else min_date
+    }
+  ) %>%
+  ungroup()
+
+hospitaliz <- hospitaliz %>%
+  mutate(
+    hospital = if_else(is.na(hospital_DATE), 0, 1),
+    hospital_censor = if_else(is.na(hospital_DATE), 1, 0)
+  )
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(hospitaliz, PERSON_ID, hospital_DATE, hospital, hospital_censor), by = 'PERSON_ID')
+unique(patient_mono_time_ps_demo)
+
+
+
+# survival days
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(
+    hospital_survival_days = if_else(
+      !is.na(hospital_DATE),
+      as.integer(as.Date(hospital_DATE) - as.Date(index_fu)) + 1,
+      as.integer(as.Date(COHORT_END_DATE) - as.Date(index_fu)) + 1
+    )
+  )
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(
+    hospital_survival_days = if_else(hospital_survival_days > 730, 730, hospital_survival_days),
+    hospital_survival_days = if_else(hospital_survival_days < 0, 0, hospital_survival_days)
+  )
+
+
+
+# Incidence
+hospital_incidence <- patient_mono_time_ps_demo %>%
+  group_by(TARGET) %>%
+  summarise(
+    total = n(),  # 전체 개체 수
+    Hospital = sum(hospital, na.rm = TRUE),  # 사망한 경우의 수
+    incidence_per_1000 = (Hospital / total) * 1000  # 천명당 사망 발생률
+  )
+
+print(hospital_incidence)
+
+
+# K-M plot
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(Population = if_else(TARGET == 1, "Target", "Comparator"))
+
+
+KM_mat <- survfit(Surv(hospital_survival_days, hospital) ~ Population, type="kaplan-meier", conf.type="log", data=patient_mono_time_ps_demo)
+(logrank<-survdiff(Surv(hospital_survival_days, hospital) ~ Population, data=patient_mono_time_ps_demo))
+
+
+
+
+
+# Load necessary libraries
+library(grid)
+library(cowplot)
+
+# Extract median survival and confidence intervals for each group
+median_ici <- summary(KM_mat)$table["Population=Comparator", "median"]
+ci_ici_lower <- summary(KM_mat)$table["Population=Comparator", "0.95LCL"]
+ci_ici_upper <- summary(KM_mat)$table["Population=Comparator", "0.95UCL"]
+
+median_ici_steroid <- summary(KM_mat)$table["Population=Target", "median"]
+ci_ici_steroid_lower <- summary(KM_mat)$table["Population=Target", "0.95LCL"]
+ci_ici_steroid_upper <- summary(KM_mat)$table["Population=Target", "0.95UCL"]
+
+
+two_year_survival <- summary(KM_mat, times = 730)
+print(two_year_survival)
+
+# Kaplan-Meier plot and risk table
+ggsurv <- ggsurvplot(
+  KM_mat, data = patient_mono_time_ps_demo,
+  pval = TRUE, conf.int = TRUE,
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  risk.table.height = 0.25,
+  ggtheme = theme_minimal(),
+  legend.title = "Strata",
+  legend.labs = c("ICI", "ICI+Steroid"),
+  palette = c("#FA6C00", "#0000CD"),
+  linetype = c("dashed", "solid"),
+  pval.coord = c(120, 0.1),
+  break.time.by = 100,
+  risk.table.breaks = seq(0, 730, by = 100), # 리스크 테이블을 100일 간격으로 설정
+  xlim = c(0, 730) # x축 최대값을 1095로 설정
+)
+
+# Add labels for median survival and confidence intervals
+median_text_ici <- paste("Median:", round(median_ici, 1),
+                         "days (95% CI:", round(ci_ici_lower, 1), "-",
+                         round(ci_ici_upper, 1), ")")
+median_text_ici_steroid <- paste("Median:", round(median_ici_steroid, 1),
+                                 "days (95% CI:", round(ci_ici_steroid_lower, 1), "-",
+                                 round(ci_ici_steroid_upper, 1), ")")
+
+ggsurv$plot <- ggsurv$plot +
+  labs(
+    title = "Kaplan-Meier Survival Estimates: Hospital",
+    x = "Time in days",
+    y = "Event-free Survival Probability"
+  ) +
+  annotate("segment", x = median_ici, xend = median_ici,
+           y = 0, yend = 0.5, linetype = "dashed", color = "#FA6C00") +
+  annotate("text", x = median_ici + 15, y = 0.55,
+           label = median_text_ici, color = "#FA6C00", vjust = -1, hjust = 0, size = 5) +
+  annotate("segment", x = median_ici_steroid, xend = median_ici_steroid,
+           y = 0, yend = 0.5, linetype = "solid", color = "#0000CD") +
+  annotate("text", x = median_ici_steroid + 15, y = 0.50,
+           label = median_text_ici_steroid, color = "#0000CD", vjust = -1, hjust = 0, size = 5) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5),
+    axis.title.x = element_text(vjust = -0.2),
+    axis.title.y = element_text(vjust = 5, hjust = 0.5),
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_line(color = "grey95"),
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  ) +
+  coord_cartesian(xlim = c(0, 730))
+
+# Align the KM plot and risk table using cowplot
+km_plot <- ggsurv$plot
+risk_table <- ggsurv$table + theme(axis.title.x = element_blank(), axis.text.x = element_blank())
+
+# Combine plots with aligned width
+combined_plot <- plot_grid(
+  km_plot, risk_table,
+  align = "v", ncol = 1, rel_heights = c(3, 1)
+)
+
+
+pdf("KM_hospital_PSM_combined_sev_250321.pdf", width = 13, height = 12)
+print(ggsurv)
+dev.off()
+
+
+
+
+
+```
+
+
+
+
+
+9. 매칭 이후 최종 코호트에서 다음 값 산출 
+- ICI 사용기간
+- ICI-steroid 실제 병용 기간
+- Follow-up period
+
+```{r}
+
+
+# 1. ICI 사용기간: indexu_f ~ ICI monotherapy 의 중단일
+ICI_dc <- left_join(select(patient_mono_time_ps_demo, PERSON_ID, index_fu), ICI_collapsed_filtered, by = 'PERSON_ID')
+ICI_dc <- left_join(ICI_dc, afterICI_cancer_agent, by = 'PERSON_ID')
+ICI_dc <- left_join(select(patient_mono_time_ps_demo, PERSON_ID),
+  ICI_dc,
+  by = 'PERSON_ID')
+
+ICI_dc <- ICI_dc %>%
+  rowwise() %>%
+  mutate(
+    ICI_DC_DATE = if_else(ICI_END_DATE < index_fu, ICI_END_DATE,
+    if_else(is.na(other_CA_START_DATE) & ICI_END_DATE >= index_fu, ICI_END_DATE,
+    if_else(!is.na(other_CA_START_DATE) & ICI_END_DATE >= index_fu, min(other_CA_START_DATE, ICI_END_DATE), NA))) 
+    ) %>%
+  ungroup()
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(ICI_dc, PERSON_ID, ICI_DC_DATE), by = 'PERSON_ID')
+
+
+
+patient_final_duration <- patient_mono_time_ps_demo %>%
+  mutate(
+    ICI_mono_duration = if_else(
+      !is.na(ICI_DC_DATE),
+      as.integer(as.Date(ICI_DC_DATE) - as.Date(index_fu)) + 1,
+      as.integer(as.Date(COHORT_END_DATE) - as.Date(index_fu)) + 1
+    )
+  )
+patient_final_duration <- patient_final_duration %>%
+  mutate(
+    ICI_mono_duration = if_else(ICI_mono_duration > 730, 730, ICI_mono_duration),
+    ICI_mono_duration = if_else(ICI_mono_duration < 0, 0, ICI_mono_duration)
+  )
+
+
+
+## 2024.07.17. 본원 SQL 다시 돌린 이후에 TARGET에서 NA있는지 재확인 필요
+# 2. ICI_steroid "실제" 병용기간: 
+### 이건 target군에서만 산출 가능. 그리고 index_fu이 ad_steroid 구간이기 때문에 steroid & ICI 기준으로 산출
+Steroid_collapsed <- read.csv("Steroid_collapsed.CSV")[,-1]
+
+Steroid_collapsed <- Steroid_collapsed %>%
+  mutate(
+    concom_duration = (as.integer(as.Date(Steroid_END_DATE) - as.Date(Steroid_START_DATE)) + 1))
+
+
+ICI_Steroid_duration <- Steroid_collapsed %>%
+  group_by(PERSON_ID) %>%
+  summarise(Steroid_ICI_duration = sum(concom_duration, na.rm = TRUE))
+ICI_Steroid_duration <- unique(ICI_Steroid_duration)
+
+patient_final_duration <- left_join(patient_final_duration, ICI_Steroid_duration, by = "PERSON_ID")
+
+
+
+#3. follow-up period = death_survival_days
+
+patient_final_duration <- select(patient_final_duration, PERSON_ID, pair_id, Population, ICI_mono_duration, Steroid_ICI_duration, death_survival_days)
+
+
+
+
+
+# TARGET과 COMPARATOR에서 평균값 차이 검정
+table3 <- CreateTableOne(data = patient_final_duration,
+                         strata = 'Population')
+
+table3 <- as.data.frame(print(table3, quote = FALSE, noSpaces = TRUE))
+write.csv(table3, file = "table3_sev_250321.CSV")
+
+
+
+```
+
+
+
+
+
+
+10. Hazard regression ::::  time-dependent cox / Adjusted HR
+모두 time변수로 보정하되 index 시점부터이미 1 이었던 것은 1로 보정
+
+##########----2024.10.11.
+(1) PSM Demographic에서 차이를 보인 변수: OPIOIDs, AUTOIMMUNE - FIXED 변수
+(2) DAG에서 보정 필요한 변수로 나온 변수: irAE & sepsis - time 변수
+
+2025.01. smd 절대값 0.2 이상 = outcome 보정변수:: AUTOIMMUNE, OPIOID - PSM//// sepsis, irAE - DAG
+20250321 + hospital sever?
+
+
+```{r}
+### 일반 COX 분석
+
+cox_data <- select(patient_mono_time_ps_demo, PERSON_ID, TARGET, Population, pair_id, index_fu, COHORT_END_DATE, 
+                   OPIOID, AUTOIMMUNE, Sepsis, irAE, hospital_sever,
+                   death_survival_days, DEATH, DEATH_DATE, MFS_days, MFS, MFS_DATE, 
+                   change_survival_days, ICI_dc_chemo, regimen_change, hospital_survival_days, hospital, hospital_DATE)
+str(cox_data)
+cox_data$TARGET <- as.numeric(cox_data$TARGET)
+cox_data$pair_id <- as.numeric(cox_data$pair_id)
+cox_data$OPIOID <- as.numeric(cox_data$OPIOID)
+cox_data$AUTOIMMUNE <- as.numeric(cox_data$AUTOIMMUNE)
+cox_data$Sepsis <- as.numeric(cox_data$Sepsis)
+cox_data$irAE <- as.numeric(cox_data$irAE)
+cox_data$hospital_sever <- as.numeric(cox_data$hospital_sever)
+
+
+
+
+
+## sepsis 제외
+cox_model_death <- coxph(Surv(death_survival_days, DEATH) ~ irAE + AUTOIMMUNE + OPIOID + hospital_sever + TARGET + strata(pair_id), data = cox_data)
+schoenfeld_test <- cox.zph(cox_model_death)
+print(schoenfeld_test) ## P>0.05로 비례위험 가정 성립(20250321)
+summary(cox_model_death)
+
+
+
+
+
+cox_model_death <- coxph(Surv(death_survival_days, DEATH) ~ irAE + AUTOIMMUNE + OPIOID + TARGET + strata(pair_id), data = cox_data)
+schoenfeld_test <- cox.zph(cox_model_death)
+print(schoenfeld_test) ## P>0.05로 비례위험 가정 성립(20250321)
+
+summary(cox_model_death)
+
+
+cox_model_death <- coxph(Surv(death_survival_days, DEATH) ~ TARGET + strata(pair_id), data = cox_data)
+schoenfeld_test <- cox.zph(cox_model_death)
+print(schoenfeld_test) ## P>0.05로 비례위험 가정 성립 (20250321)
+
+summary(cox_model_death)
+
+
+
+
+
+
+
+cox_model_MFS <- coxph(Surv(MFS_days, MFS) ~ irAE + AUTOIMMUNE + OPIOID + hospital_sever + TARGET + strata(pair_id), data = cox_data)
+schoenfeld_test <- cox.zph(cox_model_MFS)
+print(schoenfeld_test) 
+summary(cox_model_MFS)
+
+
+
+
+##sepsis 제외
+cox_model_hospital <- coxph(Surv(hospital_survival_days, hospital) ~ irAE + AUTOIMMUNE + OPIOID + hospital_sever + TARGET + strata(pair_id), data = cox_data)
+schoenfeld_test <- cox.zph(cox_model_hospital)
+print(schoenfeld_test) ## P>0.05로 비례위험 가정 성립
+summary(cox_model_hospital)
+
+
+
+
+#3 sepsis 제외
+cox_model_TTNT <- coxph(Surv(change_survival_days, ICI_dc_chemo) ~ irAE + AUTOIMMUNE + OPIOID + hospital_sever + TARGET + strata(pair_id), data = cox_data)
+schoenfeld_test <- cox.zph(cox_model_TTNT)
+print(schoenfeld_test) 
+summary(cox_model_TTNT)
+
+
+
+
+### Time-dependent cox-----------------------------------------------------------------------
+
+colnames(patient_mono_time_ps_demo)
+
+
+time_cox <- select(patient_mono_time_ps_demo, PERSON_ID, TARGET, Population, pair_id, index_fu, COHORT_END_DATE, 
+                   OPIOID, AUTOIMMUNE, hospital_sever,
+                   death_survival_days, DEATH, DEATH_DATE, MFS_days, MFS, MFS_DATE, 
+                   change_survival_days, ICI_dc_chemo, regimen_change, hospital_survival_days, hospital, hospital_DATE)
+
+time_cox <- time_cox %>%
+  mutate(
+    fu_period = case_when(
+      TARGET == 1 & death_survival_days < 30 ~ 1,
+      TARGET == 1 & death_survival_days >= 30 & death_survival_days < 60 ~ 2,
+      TARGET == 1 & death_survival_days >= 60 & death_survival_days < 90 ~ 3,
+      TARGET == 1 & death_survival_days >= 90 & death_survival_days < 120 ~ 4,
+      TARGET == 1 & death_survival_days >= 120 & death_survival_days < 180 ~ 5,
+      TARGET == 1 & death_survival_days >= 180 & death_survival_days < 270 ~ 6,
+      TARGET == 1 & death_survival_days >= 270 & death_survival_days < 365 ~ 7,
+      TARGET == 1 & death_survival_days >= 365 & death_survival_days < 545 ~ 8,
+      TARGET == 1 & death_survival_days >= 545 & death_survival_days <= 730 ~ 9,
+      TARGET == 1 & death_survival_days > 730 & death_survival_days <= 1095 ~ 10,
+      TARGET == 0 & death_survival_days < 30 ~ 1,
+      TARGET == 0 & death_survival_days >= 30 & death_survival_days < 60 ~ 2,
+      TARGET == 0 & death_survival_days >= 60 & death_survival_days < 90 ~ 3,
+      TARGET == 0 & death_survival_days >= 90 & death_survival_days < 120 ~ 4,
+      TARGET == 0 & death_survival_days >= 120 & death_survival_days < 180 ~ 5,
+      TARGET == 0 & death_survival_days >= 180 & death_survival_days < 270 ~ 6,
+      TARGET == 0 & death_survival_days >= 270 & death_survival_days < 365 ~ 7,
+      TARGET == 0 & death_survival_days >= 365 & death_survival_days < 545 ~ 8,
+      TARGET == 0 & death_survival_days >= 545 & death_survival_days <= 730 ~ 9,
+      TARGET == 0 & death_survival_days > 730 & death_survival_days <= 1095 ~ 10
+    )
+  )
+
+
+
+#Sepsis
+sepsis <- read.csv("sepsis.CSV")[,-1]
+sepsis <- left_join(sepsis, select(time_cox, c(PERSON_ID, index_fu)), by = 'PERSON_ID')
+
+sepsis <- sepsis %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      index_fu = as.Date(index_fu)
+    ) %>%
+    mutate(
+      Index_sepsis_days = as.numeric(difftime(CONDITION_START_DATE, index_fu, units = "days")+1)
+    ) %>%
+    ungroup()
+
+
+sepsis <- sepsis %>%
+  mutate(
+    Sepsis_occur = case_when(
+      Index_sepsis_days < 30 ~ 1,
+      Index_sepsis_days >= 30 & Index_sepsis_days < 60 ~ 2,
+      Index_sepsis_days >= 60 & Index_sepsis_days < 90 ~ 3,
+      Index_sepsis_days >= 90 & Index_sepsis_days < 120 ~ 4,
+      Index_sepsis_days >= 120 & Index_sepsis_days < 180 ~ 5,
+      Index_sepsis_days >= 180 & Index_sepsis_days < 270 ~ 6,
+      Index_sepsis_days >= 270 & Index_sepsis_days < 365 ~ 7,
+      Index_sepsis_days >= 365 & Index_sepsis_days < 545 ~ 8,
+      Index_sepsis_days >= 545 & Index_sepsis_days <= 730 ~ 9,
+      Index_sepsis_days > 730 & Index_sepsis_days <= 1095 ~ 10
+    )
+  )
+sepsis <- unique(select(sepsis, PERSON_ID, Sepsis_occur))
+sepsis <- sepsis %>%
+  group_by(PERSON_ID) %>%
+  summarise(sepsis_start = min(Sepsis_occur),
+          sepsis_end = max(Sepsis_occur))
+
+time_cox <- left_join(time_cox, sepsis, by = "PERSON_ID")
+
+
+
+
+# irAE
+irAE <- read.csv("irAE_total.CSV")[,-1]
+
+##
+irAE <- left_join(irAE, select(time_cox, c(PERSON_ID, index_fu)), by = 'PERSON_ID')
+
+irAE <- irAE %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      index_fu = as.Date(index_fu)
+    ) %>%
+    mutate(
+      Index_sepsis_days = as.numeric(difftime(CONDITION_START_DATE, index_fu, units = "days")+1)
+    ) %>%
+    ungroup()
+
+irAE <- irAE %>%
+  mutate(
+    irAE_occur = case_when(
+      Index_sepsis_days < 30 ~ 1,
+      Index_sepsis_days >= 30 & Index_sepsis_days < 60 ~ 2,
+      Index_sepsis_days >= 60 & Index_sepsis_days < 90 ~ 3,
+      Index_sepsis_days >= 90 & Index_sepsis_days < 120 ~ 4,
+      Index_sepsis_days >= 120 & Index_sepsis_days < 180 ~ 5,
+      Index_sepsis_days >= 180 & Index_sepsis_days < 270 ~ 6,
+      Index_sepsis_days >= 270 & Index_sepsis_days < 365 ~ 7,
+      Index_sepsis_days >= 365 & Index_sepsis_days < 545 ~ 8,
+      Index_sepsis_days >= 545 & Index_sepsis_days <= 730 ~ 9,
+      Index_sepsis_days > 730 & Index_sepsis_days <= 1095 ~ 10
+    )
+  )
+irAE <- unique(select(irAE, PERSON_ID, irAE_occur))
+irAE <- irAE %>%
+  group_by(PERSON_ID) %>%
+  summarise(irAE_start = min(irAE_occur),
+          irAE_end = max(irAE_occur))
+
+time_cox <- left_join(time_cox, irAE, by = "PERSON_ID")
+
+
+
+
+
+
+
+time_cox <- time_cox %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      index_fu = as.Date(index_fu)
+    ) %>%
+    mutate(
+      Index_death_days = as.integer(as.Date(DEATH_DATE) - as.Date(index_fu) +1)
+    ) %>%
+    ungroup()
+
+time_cox <- time_cox %>%
+  mutate(
+    Death_occur = case_when(
+      Index_death_days < 30 ~ 1,
+      Index_death_days >= 30 & Index_death_days < 60 ~ 2,
+      Index_death_days >= 60 & Index_death_days < 90 ~ 3,
+      Index_death_days >= 90 & Index_death_days < 120 ~ 4,
+      Index_death_days >= 120 & Index_death_days < 180 ~ 5,
+      Index_death_days >= 180 & Index_death_days < 270 ~ 6,
+      Index_death_days >= 270 & Index_death_days < 365 ~ 7,
+      Index_death_days >= 365 & Index_death_days < 545 ~ 8,
+      Index_death_days >= 545 & Index_death_days <= 730 ~ 9,
+      Index_death_days > 730 & Index_death_days <= 1095 ~ 10
+    )
+  )
+
+
+time_cox <- time_cox %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      index_fu = as.Date(index_fu)
+    ) %>%
+    mutate(
+      Index_PFS_meta_days = as.integer(as.Date(MFS_DATE) - as.Date(index_fu) +1)
+    ) %>%
+    ungroup()
+
+time_cox <- time_cox %>%
+  mutate(
+    Meta_occur = case_when(
+      Index_PFS_meta_days < 30 ~ 1,
+      Index_PFS_meta_days >= 30 & Index_PFS_meta_days < 60 ~ 2,
+      Index_PFS_meta_days >= 60 & Index_PFS_meta_days < 90 ~ 3,
+      Index_PFS_meta_days >= 90 & Index_PFS_meta_days < 120 ~ 4,
+      Index_PFS_meta_days >= 120 & Index_PFS_meta_days < 180 ~ 5,
+      Index_PFS_meta_days >= 180 & Index_PFS_meta_days < 270 ~ 6,
+      Index_PFS_meta_days >= 270 & Index_PFS_meta_days < 365 ~ 7,
+      Index_PFS_meta_days >= 365 & Index_PFS_meta_days < 545 ~ 8,
+      Index_PFS_meta_days >= 545 & Index_PFS_meta_days <= 730 ~ 9,
+      Index_PFS_meta_days > 730 & Index_PFS_meta_days <= 1095 ~ 10
+    )
+  )
+
+
+time_cox <- time_cox %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      index_fu = as.Date(index_fu)
+    ) %>%
+    mutate(
+      Index_hos_days =  as.integer(as.Date(hospital_DATE) - as.Date(index_fu) +1)
+    ) %>%
+    ungroup()
+
+time_cox <- time_cox %>%
+  mutate(
+    Hospital_occur = case_when(
+      Index_hos_days < 30 ~ 1,
+      Index_hos_days >= 30 & Index_hos_days < 60 ~ 2,
+      Index_hos_days >= 60 & Index_hos_days < 90 ~ 3,
+      Index_hos_days >= 90 & Index_hos_days < 120 ~ 4,
+      Index_hos_days >= 120 & Index_hos_days < 180 ~ 5,
+      Index_hos_days >= 180 & Index_hos_days < 270 ~ 6,
+      Index_hos_days >= 270 & Index_hos_days < 365 ~ 7,
+      Index_hos_days >= 365 & Index_hos_days < 545 ~ 8,
+      Index_hos_days >= 545 & Index_hos_days <= 730 ~ 9,
+      Index_hos_days > 730 & Index_hos_days <= 1095 ~ 10
+    )
+  )
+
+
+
+
+time_cox <- time_cox %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      index_fu = as.Date(index_fu)
+    ) %>%
+    mutate(
+      Index_TTNT_days =  as.integer(as.Date(regimen_change) - as.Date(index_fu) +1)
+    ) %>%
+    ungroup()
+
+time_cox <- time_cox %>%
+  mutate(
+    TTNT_occur = case_when(
+      Index_TTNT_days < 30 ~ 1,
+      Index_TTNT_days >= 30 & Index_TTNT_days < 60 ~ 2,
+      Index_TTNT_days >= 60 & Index_TTNT_days < 90 ~ 3,
+      Index_TTNT_days >= 90 & Index_TTNT_days < 120 ~ 4,
+      Index_TTNT_days >= 120 & Index_TTNT_days < 180 ~ 5,
+      Index_TTNT_days >= 180 & Index_TTNT_days < 270 ~ 6,
+      Index_TTNT_days >= 270 & Index_TTNT_days < 365 ~ 7,
+      Index_TTNT_days >= 365 & Index_TTNT_days < 545 ~ 8,
+      Index_TTNT_days >= 545 & Index_TTNT_days <= 730 ~ 9,
+      Index_TTNT_days > 730 & Index_TTNT_days <= 1095 ~ 10
+    )
+  )
+
+
+
+
+
+
+
+
+### time-dependent COX
+
+
+colnames(time_cox)
+library(tidyr)
+
+#1) death
+death_cox <- select(time_cox, PERSON_ID, pair_id, TARGET, fu_period, AUTOIMMUNE, OPIOID, sepsis_start, sepsis_end, irAE_start, irAE_end, Death_occur)
+
+death_cox <- death_cox %>%
+  rowwise() %>%
+  do(data.frame(
+    PERSON_ID = .$PERSON_ID,
+    pair_id = .$pair_id,
+    TARGET = .$TARGET,
+    period = 1:.$fu_period,
+    AUTOIMMUNE = .$AUTOIMMUNE,
+    OPIOID = .$OPIOID,
+    sepsis_start = .$sepsis_start,
+    sepsis_end = .$sepsis_end,
+    irAE_start = .$irAE_start,
+    irAE_end = .$irAE_end,
+    Death_occur = .$Death_occur
+  )) %>%
+  ungroup()
+
+death_cox <- death_cox %>%
+  mutate(
+    start = period - 1,
+    stop = period,
+    sepsis_event = ifelse(period >= sepsis_start & period <= sepsis_end, 1, 0),
+    irAE_event = ifelse(period >= irAE_start & period <= irAE_end, 1, 0),
+    Death_event = ifelse(period == Death_occur, 1, 0),
+  )
+
+
+death_cox <- death_cox %>%
+  filter(period != 10)
+
+
+colnames(death_cox)
+death_cox <- select(death_cox, PERSON_ID, pair_id, TARGET, start, stop, sepsis_event, irAE_event, Death_event, AUTOIMMUNE, OPIOID)
+
+death_cox[is.na(death_cox)] <- 0
+
+
+time_cox_model_death <- coxph(Surv(start, stop, Death_event) ~ sepsis_event + irAE_event + AUTOIMMUNE + OPIOID + TARGET, cluster(pair_id), data = death_cox) ##시작시점, 끝시점, outcome
+
+time_cox_model_death <- coxph(Surv(start, stop, Death_event) ~ sepsis_event + irAE_event + AUTOIMMUNE + OPIOID + TARGET + strata(pair_id), data = death_cox) ##시작시점, 끝시점, outcome
+
+time_cox_model_death <- coxph(Surv(start, stop, Death_event) ~ sepsis_event + irAE_event + AUTOIMMUNE + OPIOID + TARGET, data = death_cox) ##시작시점, 끝시점, outcome
+
+
+summary(time_cox_model_death)
+
+
+
+
+time_cox_model_death <- coxph(Surv(start, stop, Death_event) ~ AUTOIMMUNE + TARGET, cluster(pair_id), data = death_cox) ##시작시점, 끝시점, outcome
+summary(time_cox_model_death)
+
+
+time_cox_model_death <- coxph(Surv(start, stop, Death_event) ~ sepsis_event + AUTOIMMUNE + TARGET, cluster(pair_id), data = death_cox) ##시작시점, 끝시점, outcome
+summary(time_cox_model_death)
+
+
+
+
+#2) meta
+ 
+meta_cox <- select(time_cox, PERSON_ID, pair_id, TARGET, fu_period, OPIOID, AUTOIMMUNE, hospital_sever, sepsis_start, sepsis_end, irAE_start, irAE_end, Meta_occur)
+
+meta_cox <- meta_cox %>%
+  rowwise() %>%
+  do(data.frame(
+    PERSON_ID = .$PERSON_ID,
+    pair_id = .$pair_id,
+    TARGET = .$TARGET,
+    period = 1:.$fu_period,
+    AUTOIMMUNE = .$AUTOIMMUNE,
+    OPIOID = .$OPIOID,
+    hospital_sever = .$hospital_sever,
+    sepsis_start = .$sepsis_start,
+    sepsis_end = .$sepsis_end,
+    irAE_start = .$irAE_start,
+    irAE_end = .$irAE_end,
+    Meta_occur = .$Meta_occur
+  )) %>%
+  ungroup()
+
+
+meta_cox <- meta_cox %>%
+  mutate(
+    start = period - 1,
+    stop = period,
+    sepsis_event = ifelse(period >= sepsis_start & period <= sepsis_end, 1, 0),
+    irAE_event = ifelse(period >= irAE_start & period <= irAE_end, 1, 0),   
+    Meta_event = ifelse(period == Meta_occur, 1, 0),   
+  )
+
+
+meta_cox <- meta_cox %>% 
+  filter(period != 10)
+
+
+colnames(meta_cox)
+meta_cox <- select(meta_cox, PERSON_ID, pair_id, TARGET, start, stop, sepsis_event, irAE_event, Meta_event, AUTOIMMUNE, OPIOID, hospital_sever)
+
+meta_cox[is.na(meta_cox)] <- 0
+
+
+time_cox_model_meta <- coxph(Surv(start, stop, Meta_event) ~ irAE_event + AUTOIMMUNE + OPIOID + hospital_sever + TARGET + strata(pair_id), data = meta_cox) ##시작시점, 끝시점, outcome
+summary(time_cox_model_meta)
+
+
+time_cox_model_meta <- coxph(Surv(start, stop, Meta_event) ~ irAE_event + AUTOIMMUNE + OPIOID + TARGET + strata(pair_id), data = meta_cox) ##시작시점, 끝시점, outcome
+summary(time_cox_model_meta)
+
+
+
+
+
+```
+
+
