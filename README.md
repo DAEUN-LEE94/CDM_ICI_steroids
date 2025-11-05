@@ -18,8 +18,8 @@ Analyses were performed across four Korean tertiary hospitals using the Observat
 Cohort definition and database-specific queries for reproducible cohort construction in ATLAS.  
 - [ATLAS_entry cohort_definition.docx](./ATLAS_entry%20cohort_definition.docx)
 - [ATLAS_entry cohort_JSON.txt](./ATLAS_entry%20cohort_JSON.txt)
-- [ATLAS_entry cohort_Oracle.txt](./ATLAS_entry%20cohort_Oracle.docx)
-- [ATLAS_entry cohort_PostgreSQL.txt](./ATLAS_entry%20cohort_PostgreSQL.docx)
+- [ATLAS_entry cohort_Oracle.txt](./ATLAS_entry%20cohort_Oracle.txt)
+- [ATLAS_entry cohort_PostgreSQL.txt](./ATLAS_entry%20cohort_PostgreSQL.txt)
 
 ### 2️⃣ Concept Sets  
 Clinical concept definitions used for cohort inclusion/exclusion and covariate construction.  
