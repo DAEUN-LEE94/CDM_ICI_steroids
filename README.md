@@ -27,9 +27,9 @@ Clinical concept definitions used for cohort inclusion/exclusion and covariate c
 
 ### 3️⃣ Analysis Code (R Markdown)  
 R scripts for data extraction, matching, and outcome estimation.  
-- `1_ICI_CDM_SQL_Data extraction.Rmd` — Extract CDM-based patient- and treatment-level data  
-- `2_ICI_CDM_Data prep_TDPS MATCH.Rmd` — Prepare data and perform time-dependent propensity score (TDPS) matching  
-- `3_ICI_CDM_outcome estimation.Rmd` — Estimate survival and treatment effects with Cox models and meta-analysis  
+- [1_ICI_CDM_SQL_Data extraction.Rmd](./1_ICI_CDM_SQL_Data%20extraction.Rmd) — Extract CDM-based patient- and treatment-level data  
+- [2_ICI_CDM_Data prep_TDPS MATCH.Rmd](./2_ICI_CDM_Data%20prep_TDPS%20MATCH.Rmd) — Prepare data and perform time-dependent propensity score (TDPS) matching  
+- [3_ICI_CDM_outcome estimation.Rmd](./3_ICI_CDM_outcome%20estimation.Rmd) — Estimate survival and treatment effects with Cox models and meta-analysis  
 
 ---
 
