@@ -1,0 +1,2222 @@
+
+1. Case/Control definition: ICI & Steroid
+2. Covariates: PS Matching at Cohort Entry (ICI New use)
+3. Index date matching: ICI use cycle in Case/Control
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)
+
+library(MatchIt)
+library(tableone)
+library(glmtoolbox)
+library(Hmisc)
+
+```
+
+
+[Steroid concept set 다시 정의하고 생리학적 용량 미만을 다시 정확히 정의해야 하지 않는지...?]
+
+
+
+
+1. Definition of Case & Control
+JOIN: Drug_Exposure Tables of ICI and Steroid
+    환자군정의: ICI 사용개시 이후 연속사용기간 내 스테로이드 병용
+                (+_60일 기준, 120일 collapse, 마지막 사용일 기준 60일까지는 관찰함)
+    대조군정의: ICI 사용개시 이후 연속사용기간 내 스테로이드 미사용 (동일 기준 적용용)
+
+```{r}
+# knitr::opts_knit$set(root.dir = "C:/ICI_분석 코드 및 데이터")
+setwd("D:/SNUH_OJM")
+# getwd()
+ICI <- read.csv("ICI.CSV")[,-1]
+
+patient <- read.csv("patient.CSV")[,-1]
+steroid <- read.csv("steroid.CSV")[,-1]
+steroid <- steroid %>%
+  filter(ROUTE_SOURCE_VALUE != "외용")
+
+
+print(unique(ICI$DRUG_CONCEPT_ID))
+# 36808878 36809461 41370369 42629082 42922128 46276413
+# 46276413	4 ML pembrolizumab 25 MG/ML Injection	Drug	Standard			
+# 42629082	20 ML atezolizumab 60 MG/ML Injection	Drug	Standard			
+# 36809461	2.4 ML durvalumab 50 MG/ML Injectable Solution	Drug	Standard			
+# 42922128	2 ML nivolumab 10 MG/ML Injectable Solution	Drug	Standard			
+# 41370369	10 ML nivolumab 10 MG/ML Injectable Solution	Drug	Standard			
+# 36808878	10 ML durvalumab 50 MG/ML Injectable Solution
+
+
+# 1) 환자별 ICI 연속사용기간 정의 (120일 단위 collapse) 
+# ICI 종류
+ICI_drug <- ICI %>%
+  mutate(
+    pembrolizumab = as.integer(DRUG_CONCEPT_ID == 46276413),
+    nivolumab = as.integer(DRUG_CONCEPT_ID %in% c(42922128, 41370369)),
+    atezolizumab = as.integer(DRUG_CONCEPT_ID == 42629082),
+    durvalumab = as.integer(DRUG_CONCEPT_ID %in% c(36809461, 36808878))
+  )
+# 각 환자별로 약제 사용 여부를 1 또는 0으로 집계
+ICI_drug <- ICI_drug %>%
+  group_by(PERSON_ID) %>%
+  summarise(
+    pembrolizumab_use = max(pembrolizumab),
+    nivolumab_use = max(nivolumab),
+    atezolizumab_use = max(atezolizumab),
+    durvalumab_use = max(durvalumab),
+    .groups = 'drop'
+  )
+
+
+# collapse 120일 기준 함수 정의
+calculate_date_diff120 <- function(df) {
+  df %>%
+    mutate(
+      DRUG_EXPOSURE_START_DATE = as.Date(DRUG_EXPOSURE_START_DATE),
+      DRUG_EXPOSURE_END_DATE = as.Date(DRUG_EXPOSURE_END_DATE)
+    ) %>%
+    arrange(PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE) %>%
+    group_by(PERSON_ID) %>%
+    mutate(
+      prev_end_date = lag(DRUG_EXPOSURE_END_DATE),
+      overlap = DRUG_EXPOSURE_START_DATE <= prev_end_date,
+      gap = as.numeric(difftime(DRUG_EXPOSURE_START_DATE, prev_end_date, units = "days"))
+    ) %>%
+    mutate(
+      continuous_group = cumsum(ifelse(is.na(gap) | overlap | gap <= 120, 0, 1))
+    ) %>%
+    group_by(PERSON_ID, continuous_group) %>%
+    summarise(
+      ICI_START_DATE = min(DRUG_EXPOSURE_START_DATE),
+      ICI_END_DATE = max(DRUG_EXPOSURE_END_DATE),
+      .groups = 'drop'
+    ) %>%
+    ungroup() %>%
+    select(-continuous_group)
+}
+
+
+ICI_continu <- select(ICI, PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE)
+ICI_continu <- unique(ICI_continu)
+ICI_collapsed <- calculate_date_diff120(ICI_continu)
+ICI_collapsed <- unique(ICI_collapsed)
+
+
+
+
+# 2) 연속사용기간+60일 내에 스테로이드 drug_exposure_start_date 행만 필터링
+ICI_steroid <- data.frame()
+
+ICI_collapsed$ICI_START_DATE <- as.Date(ICI_collapsed$ICI_START_DATE)
+ICI_collapsed$ICI_END_DATE <- as.Date(ICI_collapsed$ICI_END_DATE)
+
+
+
+for (i in 1:nrow(ICI_collapsed)) {
+  filtered_steroid <- steroid %>% 
+  filter(PERSON_ID == ICI_collapsed$PERSON_ID[i]) %>%
+  filter((DRUG_EXPOSURE_START_DATE >= ICI_collapsed$ICI_START_DATE[i] &
+         DRUG_EXPOSURE_START_DATE <= ICI_collapsed$ICI_END_DATE[i] + days(60))
+         |
+        (DRUG_EXPOSURE_END_DATE >= ICI_collapsed$ICI_START_DATE[i] &
+         DRUG_EXPOSURE_START_DATE < ICI_collapsed$ICI_START_DATE[i])
+         )
+filtered_steroid$DRUG_EXPOSURE_START_DATE <- as.Date(filtered_steroid$DRUG_EXPOSURE_START_DATE)
+filtered_steroid$DRUG_EXPOSURE_END_DATE <- as.Date(filtered_steroid$DRUG_EXPOSURE_END_DATE)
+  
+ filtered_steroid <- filtered_steroid %>%
+   mutate(DRUG_EXPOSURE_START_DATE = if_else(
+     DRUG_EXPOSURE_END_DATE >= ICI_collapsed$ICI_START_DATE[i] &
+       DRUG_EXPOSURE_START_DATE < ICI_collapsed$ICI_START_DATE[i],
+     ICI_collapsed$ICI_START_DATE[i],
+     DRUG_EXPOSURE_START_DATE
+   ))
+  
+  ICI_steroid <- rbind(ICI_steroid, filtered_steroid)
+}
+ICI_steroid <- unique(ICI_steroid)
+ICI_collapsed_total <- ICI_collapsed
+ICI_steroid_total <- ICI_steroid
+write.csv(ICI_steroid_total, file = "ICI_steroid_total.CSV")
+
+
+
+
+calculate_date_diff30 <- function(df) {
+  df %>%
+    mutate(
+      DRUG_EXPOSURE_START_DATE = as.Date(DRUG_EXPOSURE_START_DATE),
+      DRUG_EXPOSURE_END_DATE = as.Date(DRUG_EXPOSURE_END_DATE)
+    ) %>%
+    arrange(PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE) %>%
+    group_by(PERSON_ID) %>%
+    mutate(
+      prev_end_date = lag(DRUG_EXPOSURE_END_DATE),
+      overlap = DRUG_EXPOSURE_START_DATE <= prev_end_date,
+      gap = as.numeric(difftime(DRUG_EXPOSURE_START_DATE, prev_end_date, units = "days"))
+    ) %>%
+    mutate(
+      continuous_group = cumsum(ifelse(is.na(gap) | overlap | gap <= 30, 0, 1))
+    ) %>%
+    group_by(PERSON_ID, continuous_group) %>%
+    summarise(
+      Steroid_START_DATE = min(DRUG_EXPOSURE_START_DATE),
+      Steroid_END_DATE = max(DRUG_EXPOSURE_END_DATE),
+      .groups = 'drop'
+    ) %>%
+    ungroup() %>%
+    select(-continuous_group)
+}
+
+ICI_steroid_conti <- select(ICI_steroid, PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE)
+ICI_steroid_conti <- unique(ICI_steroid_conti)
+Steroid_collapsed <- calculate_date_diff30(ICI_steroid_conti)
+Steroid_collapsed <- unique(Steroid_collapsed)
+Steroid_collapsed_total <- Steroid_collapsed
+
+
+
+
+
+
+
+# 3) 24.10.02. steroid new use 연속사용 기간 내에 스테로이드 사용 - case / 미사용 - control // 
+### control 에서는 연속사용기간 종료 이후에 다시 ICI+steroid 병용하면 센서링. 
+
+
+ICI_steroid <- data.frame()
+ICI_collapsed$ICI_START_DATE <- as.Date(ICI_collapsed$ICI_START_DATE)
+ICI_collapsed$ICI_END_DATE <- as.Date(ICI_collapsed$ICI_END_DATE)
+
+ICI_collapsed <- ICI_collapsed %>%
+  group_by(PERSON_ID) %>% 
+  slice_min(ICI_START_DATE) %>%
+  ungroup()
+
+
+ICI_collapsed_check <- ICI_collapsed %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    ICI_END_DATE = if_else(difftime(ICI_END_DATE, ICI_START_DATE, units = "days") > 730, ICI_START_DATE+730, ICI_END_DATE)
+  ) %>%
+  ungroup()
+
+
+
+for (i in 1:nrow(ICI_collapsed_check)) {
+  filtered_steroid <- steroid %>% 
+  filter(PERSON_ID == ICI_collapsed_check$PERSON_ID[i]) %>%
+  filter(DRUG_EXPOSURE_START_DATE >= ICI_collapsed_check$ICI_START_DATE[i] &
+         DRUG_EXPOSURE_START_DATE <= ICI_collapsed_check$ICI_END_DATE[i] + days(60)
+         |
+        DRUG_EXPOSURE_END_DATE >= ICI_collapsed_check$ICI_START_DATE[i] &
+         DRUG_EXPOSURE_START_DATE < ICI_collapsed_check$ICI_START_DATE[i]
+         )
+filtered_steroid$DRUG_EXPOSURE_START_DATE <- as.Date(filtered_steroid$DRUG_EXPOSURE_START_DATE)
+filtered_steroid$DRUG_EXPOSURE_END_DATE <- as.Date(filtered_steroid$DRUG_EXPOSURE_END_DATE)
+  
+ filtered_steroid <- filtered_steroid %>%
+   mutate(DRUG_EXPOSURE_START_DATE = if_else(
+     DRUG_EXPOSURE_END_DATE >= ICI_collapsed_check$ICI_START_DATE[i] &
+       DRUG_EXPOSURE_START_DATE < ICI_collapsed_check$ICI_START_DATE[i],
+     ICI_collapsed_check$ICI_START_DATE[i],
+     DRUG_EXPOSURE_START_DATE
+   ))
+  
+  ICI_steroid <- rbind(ICI_steroid, filtered_steroid)
+}
+ICI_steroid <- unique(ICI_steroid)
+
+calculate_date_diff30 <- function(df) {
+  df %>%
+    mutate(
+      DRUG_EXPOSURE_START_DATE = as.Date(DRUG_EXPOSURE_START_DATE),
+      DRUG_EXPOSURE_END_DATE = as.Date(DRUG_EXPOSURE_END_DATE)
+    ) %>%
+    arrange(PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE) %>%
+    group_by(PERSON_ID) %>%
+    mutate(
+      prev_end_date = lag(DRUG_EXPOSURE_END_DATE),
+      overlap = DRUG_EXPOSURE_START_DATE <= prev_end_date,
+      gap = as.numeric(difftime(DRUG_EXPOSURE_START_DATE, prev_end_date, units = "days"))
+    ) %>%
+    mutate(
+      continuous_group = cumsum(ifelse(is.na(gap) | overlap | gap <= 30, 0, 1))
+    ) %>%
+    group_by(PERSON_ID, continuous_group) %>%
+    summarise(
+      Steroid_START_DATE = min(DRUG_EXPOSURE_START_DATE),
+      Steroid_END_DATE = max(DRUG_EXPOSURE_END_DATE),
+      .groups = 'drop'
+    ) %>%
+    ungroup() %>%
+    select(-continuous_group)
+}
+
+ICI_steroid_conti <- select(ICI_steroid, PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE)
+ICI_steroid_conti <- unique(ICI_steroid_conti)
+Steroid_collapsed <- calculate_date_diff30(ICI_steroid_conti)
+Steroid_collapsed <- unique(Steroid_collapsed)
+
+
+
+CASE_patient <- data.frame()
+CASE_patient <- select(Steroid_collapsed, PERSON_ID)
+CASE_patient <- unique(CASE_patient)
+
+patient <- patient %>%
+  mutate(TARGET = ifelse(PERSON_ID %in% CASE_patient$PERSON_ID, 1, 0))
+
+
+
+### 환자당 1개의 ICI 연속사용기간만 남기기 - case는 steroid 사용시점을 기준으로 남기기, control은 가장 빠른 기간만 남기기.
+
+ICI_collapsed_check <- left_join(ICI_collapsed_check, select(patient, PERSON_ID, TARGET), by = "PERSON_ID")
+
+ICI_collapsed_filtered <- ICI_collapsed_check %>%
+  group_by(PERSON_ID) %>%
+  filter(!(TARGET == 0 & row_number() != which.min(as.Date(ICI_START_DATE)))) %>%
+  ungroup()
+
+Steroid_collapsed_uniq <- Steroid_collapsed %>%
+  group_by(PERSON_ID) %>%
+  slice(which.min(as.Date(Steroid_START_DATE)))
+
+ICI_collapsed_filtered <- left_join(ICI_collapsed_filtered, Steroid_collapsed_uniq, by = "PERSON_ID")
+
+
+ICI_collapsed_filtered <- ICI_collapsed_filtered %>%
+  group_by(PERSON_ID) %>%
+  filter(
+    (TARGET == 0) |
+    (TARGET == 1 & ICI_START_DATE <= Steroid_START_DATE)
+  ) %>%
+  ungroup()
+
+
+
+
+
+###24.10.02.=> control 에서는 연속사용기간 종료 이후에 다시 ICI+steroid 병용하면 센서링 => cohort_end_date와 비교해서 더 빠른 날짜로 치환.
+ICI_collapsed_total_filtered <- left_join(ICI_collapsed_total, select(patient, PERSON_ID, TARGET), by = "PERSON_ID")
+
+Steroid_collapsed_total_uniq <- Steroid_collapsed_total %>%
+  group_by(PERSON_ID) %>%
+  slice(which.min(as.Date(Steroid_START_DATE)))
+
+ICI_collapsed_total_filtered <- left_join(ICI_collapsed_total_filtered, Steroid_collapsed_total_uniq, by = "PERSON_ID")
+
+ICI_collapsed_total_filtered <- ICI_collapsed_total_filtered %>%
+  group_by(PERSON_ID) %>%
+  filter(
+    (TARGET == 0) |
+    (TARGET == 1 & ICI_START_DATE <= Steroid_START_DATE)
+  ) %>%
+  ungroup()
+
+Control_censor <- ICI_collapsed_total_filtered %>%
+  group_by(PERSON_ID) %>%
+  filter(
+    (TARGET == 1) & (n() >=2)
+  ) %>%
+  ungroup()
+
+
+Control_censor <- left_join(Control_censor, select(ICI_collapsed_filtered, PERSON_ID, TARGET), by = "PERSON_ID")
+Control_censor <- Control_censor %>%
+  filter(TARGET.x != TARGET.y)
+patient_newuser <- left_join(patient, select(Control_censor, PERSON_ID, Steroid_START_DATE), by = "PERSON_ID")
+patient_newuser <- unique(patient_newuser)
+
+patient_newuser$COHORT_END_DATE <- as.Date(patient_newuser$COHORT_END_DATE)
+patient_newuser$Steroid_START_DATE <- as.Date(patient_newuser$Steroid_START_DATE)
+patient_newuser <- patient_newuser %>%
+  mutate(COHORT_END_DATE = case_when(!is.na(Steroid_START_DATE) & Steroid_START_DATE < COHORT_END_DATE ~ Steroid_START_DATE,
+                                     TRUE ~ COHORT_END_DATE))
+write.csv(patient_newuser, file = "patient_newuser.CSV")
+patient <- select(patient_newuser, PERSON_ID, COHORT_START_DATE, COHORT_END_DATE, TARGET)
+ 
+#unique(ICI_collapsed_filtered$PERSON_ID)
+
+write.csv(Steroid_collapsed, file = "Steroid_collapsed.CSV")
+write.csv(ICI_collapsed_filtered, file = "ICI_collapsed_filtered.CSV")
+
+
+
+
+
+
+
+
+
+#4) 환자별 ICI use cycle & TARGET 군은 가장빠른 steroid START_DATE 이전의 use cycle 산출
+
+ICI_continu <- ICI_continu %>%
+  arrange(PERSON_ID, DRUG_EXPOSURE_START_DATE)
+
+ICI_continu <- ICI_continu %>%
+  group_by(PERSON_ID) %>%
+  mutate(ICI_use_cycle = n()) %>%
+  ungroup()  
+
+patient <- left_join(patient, select(ICI_continu, PERSON_ID, ICI_use_cycle), by = 'PERSON_ID')
+patient <- unique(patient)
+
+TARGET_index <- Steroid_collapsed %>%
+  group_by(PERSON_ID) %>%
+  summarise(Steroid_index_date = min(Steroid_START_DATE)) %>%
+  ungroup()
+
+patient <- left_join(patient, TARGET_index, by = 'PERSON_ID')
+ICI_continu <- left_join(ICI_continu, TARGET_index, by = 'PERSON_ID')
+
+
+library(dplyr)
+
+# Adjusted function to find the index of the latest DRUG_EXPOSURE_START_DATE before Steroid_index_date
+find_latest_record <- function(df, steroid_date) {
+  steroid_date <- as.Date(steroid_date)
+  valid_dates <- df %>% filter(DRUG_EXPOSURE_START_DATE <= steroid_date)
+  if (nrow(valid_dates) == 0) {
+    return(NA)
+  }
+  latest_date <- max(valid_dates$DRUG_EXPOSURE_START_DATE, na.rm = TRUE)
+  latest_index <- which.max(valid_dates$DRUG_EXPOSURE_START_DATE == latest_date)
+  return(latest_index)  #index로 찾아주는 코드(정렬필요)
+}
+
+# Applying the function to the ICI_continu dataset to create the ICI_index_cycle column
+ICI_cycle <- ICI_continu %>%
+  group_by(PERSON_ID) %>%
+  mutate(ICI_index_cycle = find_latest_record(cur_data(), Steroid_index_date)) %>%
+  ungroup()
+
+
+patient <- left_join(patient, select(ICI_cycle, PERSON_ID, ICI_index_cycle), by = 'PERSON_ID')
+patient <- unique(patient)
+
+
+
+
+#4) 환자별 ICI use days & TARGET 군은 steroid START_DATE까지의 days 산출
+ICI_use_days <- select(ICI, PERSON_ID, DRUG_EXPOSURE_END_DATE)
+ICI_use_days <- left_join(ICI_use_days, select(patient, PERSON_ID, COHORT_START_DATE), by = "PERSON_ID")
+ICI_use_days <- unique(ICI_use_days)
+
+ICI_use_days <- ICI_use_days %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE),
+      DRUG_EXPOSURE_END_DATE = as.Date(DRUG_EXPOSURE_END_DATE)
+    ) %>%
+    mutate(
+      latest_date = max(DRUG_EXPOSURE_END_DATE, na.rm = TRUE),
+      ICI_use_days = as.numeric(difftime(latest_date, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+    
+patient <- left_join(patient, select(ICI_use_days, PERSON_ID, ICI_use_days), by = 'PERSON_ID')
+patient <- unique(patient)
+patient <- patient %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE),
+      Steroid_index_date = as.Date(Steroid_index_date)
+    ) %>%
+    mutate(
+      Index_ICI_days = as.numeric(difftime(Steroid_index_date, COHORT_START_DATE, units = "days")+1)
+    )
+
+
+
+
+
+#5) 다른 항암제 병용 여부 및 시기
+# chemo
+chemo_agent <- read.csv("cancer_agent.CSV")[,-1] 
+
+# TKI_ALK
+TKI_ALK <- read.csv("TKI_ALK.CSV")[,-1]
+
+
+cancer_agent <- rbind(chemo_agent, TKI_ALK)
+cancer_agent <- left_join(cancer_agent, select(patient, PERSON_ID, COHORT_START_DATE), by = 'PERSON_ID')
+cancer_agent <- unique(cancer_agent) 
+
+afterICI_cancer_agent <- cancer_agent %>%
+  mutate(
+    COHORT_START_DATE = as.Date(COHORT_START_DATE),
+    DRUG_EXPOSURE_START_DATE = as.Date(DRUG_EXPOSURE_START_DATE)
+  ) %>%
+  filter(DRUG_EXPOSURE_START_DATE >= COHORT_START_DATE)
+
+afterICI_cancer_agent <- select(afterICI_cancer_agent, PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE)
+afterICI_cancer_agent <- unique(afterICI_cancer_agent)
+
+afterICI_cancer_agent <- afterICI_cancer_agent %>%
+  group_by(PERSON_ID) %>%
+  summarise(other_CA_START_DATE = min(DRUG_EXPOSURE_START_DATE, na.rm = TRUE)) %>%
+  ungroup() 
+
+patient <- left_join(patient, afterICI_cancer_agent, by = 'PERSON_ID')
+
+
+
+write.csv(afterICI_cancer_agent, file = "afterICI_cancer_agent.CSV")
+
+
+
+# TARGET에서 steroid 사용 시작 시점(Index) "시점"에 ICI monotherapy가 아닌 경우 제외
+patient_mono <- patient %>%
+  filter(is.na(other_CA_START_DATE) | is.na(Steroid_index_date) | 
+         (other_CA_START_DATE > Steroid_index_date))
+
+patient_mono <- patient_mono %>%
+  mutate(
+    other_CA = ifelse(is.na(other_CA_START_DATE), 0, 1)
+  )
+
+
+patient_mono <- left_join(patient_mono, ICI_drug, by = 'PERSON_ID')
+#################### 668 -> 552. CASE 347> 231 (116 제외됨.24.10.02.) 
+#### 668 -> 553. CASE 345> 230 (115 제외됨.24.12.) 
+
+
+
+```
+
+
+
+
+3. Covariates: Data prep for TDPS Matching
+# Time-fixed: before Cohort Entry (ICI New use)
+# Time-dependent: 
+## 환자군: Index_ICI_days 기준 최대 prescrib 정의(1~7)
+## 대조군: ICI_use_days 기준 최대 prescrib 정의
+##  prescrib 숫자+1만큼 아래 코드 순차적으로 실행하는 loop 
+1개월 미만 => 60일 이전 중 가장 entry 날짜에 가까운,(new-use)기준 변수 정의 적용 & FIXED 변수 정의
+1개월 이상~3개월 미만 => entry+30days 이내 가장 +30days에 가까운
+3개월 이상~6개월 미만 => entry+30 ~ 90days 이내 가장 +90days에 가까운
+6개월 이상~1년 미만 => entry+90 ~ 180days 이내 가장 +180days에 가까운
+1년 이상~2년 미만 => entry+180 ~ 365days 이내 가장 +360days에 가까운
+2년 이상~3년 미만 => entry+365 ~ 730days 이내 가장 +730days에 가까운
+3년 이상 => 수집하지 않음.
+
+
+
+## 기저 steroid 사용, 기저 chemo & TKI_ALK 사용 여부 공변량으로 추가하기!!!!!!!!!!!!!!!
+
+```{r}
+
+comorbd_disease <- read.csv("comorbd_disease.CSV")[,-1]
+concom_drug2 <- read.csv("concom_drug2.CSV")[,-1]
+sepsis <- read.csv("sepsis.CSV")[,-1]
+
+###24.10.02.컨셉추가
+irAE_total <- read.csv("irAE_total.CSV")[,-1] # covariates 24.10.02.
+# demographics
+dyspnea <- read.csv("dyspnea.CSV")[,-1]
+pneumonitis <- read.csv("pneumonitis.CSV")[,-1]
+Cardiomyopathy <- read.csv("Cardiomyopathy.CSV")[,-1]#미사용24.10.02.
+Dermatotx <- read.csv("Dermatotx.CSV")[,-1]#미사용24.10.02.
+Thyrotoxicosis <- read.csv("Thyrotoxicosis.CSV")[,-1]#미사용24.10.02.
+pancrea_soma_heptitis <- read.csv("pancrea_soma_heptitis.CSV")[,-1]#미사용24.10.02.
+
+sexbirth <- read.csv("sexbirth.CSV")[,-1]
+CBC_lab <- read.csv("CBC_lab.CSV")[,-1]
+cytokeratin <- read.csv("cytokeratin.CSV")[,-1]
+autoimmunedz <- read.csv("autoimmunedz.CSV")[,-1]
+height <- read.csv("height.CSV")[,-1]
+weight <- read.csv("weight.CSV")[,-1]
+
+###24.10.02.컨셉추가
+## CSC_sum
+CSC_RT_GKS <- read.csv("CSC_RT_GKS.CSV")[,-1] ## covariates 24.10.02.
+CSC_condition <- read.csv("CSC_condition.CSV")[,-1]
+metastasis_all <- read.csv("metastasis_all.CSV")[,-1] ## covariates 24.10.02.
+cancer_regist <- read.csv("cancer_regist.CSV")[,-1] # covariates 24.10.02.
+cancer_reg_final <- read.csv("cancer_reg_final.CSV")[,-1] # covariates 24.10.02.
+
+# demographics
+bonemeta <- read.csv("bonemeta.CSV")[,-1]
+brainmeta <- read.csv("brainmeta.CSV")[,-1]
+livermeta <- read.csv("livermeta.CSV")[,-1]
+
+cancer_lung_sq <- read.csv("cancer_lung_sq.CSV")[,-1] ## covariates,demo 24.10.02.
+cancer_lung <- read.csv("cancer_lung.CSV")[,-1] #미사용24.10.02.
+cancer_primary <- read.csv("cancer_primary.CSV")[,-1] #미사용24.10.02.
+TNM <- read.csv("TNM.CSV")[,-1] #미사용24.10.02.
+
+
+
+
+
+
+
+#1) FIXED data prep------------------------------------------------------------------------------------------------
+
+#1-1) SEX / AGE
+# 8532: 여자
+# 8507: 남자
+sexbirth_c <- left_join(sexbirth, select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by = "PERSON_ID")
+sexbirth_c <- sexbirth_c %>%
+  mutate(
+    birth_date = make_date(YEAR_OF_BIRTH, MONTH_OF_BIRTH),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE),
+    age = year(COHORT_START_DATE) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0)
+  )
+
+sexbirth_c <- sexbirth_c %>%
+  mutate(
+    sex = case_when(
+      GENDER_CONCEPT_ID == 8507 ~ "M",
+      GENDER_CONCEPT_ID == 8532 ~ "F",
+      TRUE ~ NA_character_  # GENDER_CONCEPT_ID가 이 외의 값인 경우 NA로 설정
+    )
+  )
+sexbirth_c <- sexbirth_c %>%
+  filter(!is.na(TARGET))
+
+patient_mono <- left_join(patient_mono, select(sexbirth_c, PERSON_ID, age, sex), by = 'PERSON_ID')
+
+
+
+patient_mono <- left_join(patient_mono, autoimmunedz, by = 'PERSON_ID')
+
+# comorbd_disease <- select(comorbd_disease,-c(CAD, HYPERTENSION))
+patient_mono <- left_join(patient_mono, comorbd_disease, by = 'PERSON_ID')
+
+
+
+
+# concom_drug2 <- select(concom_drug2, -c(TOPICAL_STEROID, HYPOGLYCEMIC, HYPOLIPID))
+concom_drug <- left_join(select(patient_mono, PERSON_ID), concom_drug2, by = 'PERSON_ID')
+concom_drug <- concom_drug %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+                          
+patient_mono <- left_join(patient_mono, concom_drug, by = 'PERSON_ID')                      
+
+
+
+cancer_lung_sq <- read.csv("cancer_lung_sq.CSV")[,-1] ## covariates,demo 24.10.02.
+patient_mono <- patient_mono %>%
+  mutate(squamouslc = ifelse(PERSON_ID %in% cancer_lung_sq$PERSON_ID, 1, 0))
+
+
+
+
+
+# baseline/sensitivity: pre-steroid 
+
+pre_steroid <- left_join(select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), select(steroid, PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE), by ='PERSON_ID') 
+pre_steroid <- unique(pre_steroid)
+pre_steroid <- pre_steroid %>%
+  filter(!is.na(TARGET))
+
+pre_steroid <- pre_steroid %>%
+  mutate(
+    DRUG_EXPOSURE_START_DATE = as.Date(DRUG_EXPOSURE_START_DATE),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  ) %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    pre_steroid = if_else(any(DRUG_EXPOSURE_START_DATE <= COHORT_START_DATE & 
+                              DRUG_EXPOSURE_START_DATE >= COHORT_START_DATE - 180), 1, 0)
+  ) %>%
+  ungroup()
+
+pre_steroid <- select(pre_steroid, PERSON_ID, pre_steroid)
+pre_steroid <- unique(pre_steroid)
+pre_steroid <- pre_steroid %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+
+patient_mono <- left_join(patient_mono, pre_steroid, by = 'PERSON_ID')                      
+# patient_CSAI_mono <- left_join(patient_CSAI_mono, pre_steroid, by = 'PERSON_ID')
+# patient_CSC_mono <- left_join(patient_CSC_mono, pre_steroid, by = 'PERSON_ID')
+
+
+
+
+
+# baseline: pre-chemo
+
+pre_chemo <- left_join(select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), select(chemo_agent, PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE), by ='PERSON_ID') 
+pre_chemo <- unique(pre_chemo)
+pre_chemo <- pre_chemo %>%
+  filter(!is.na(TARGET))
+
+pre_chemo <- pre_chemo %>%
+  mutate(
+    DRUG_EXPOSURE_START_DATE = as.Date(DRUG_EXPOSURE_START_DATE),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  ) %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    pre_chemo = if_else(any(DRUG_EXPOSURE_START_DATE <= COHORT_START_DATE & 
+                              DRUG_EXPOSURE_START_DATE >= COHORT_START_DATE - 180), 1, 0)
+  ) %>%
+  ungroup()
+
+pre_chemo <- select(pre_chemo, PERSON_ID, pre_chemo)
+pre_chemo <- unique(pre_chemo)
+pre_chemo <- pre_chemo %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+
+patient_mono <- left_join(patient_mono, pre_chemo, by = 'PERSON_ID')                      
+# patient_CSAI_mono <- left_join(patient_CSAI_mono, pre_chemo, by = 'PERSON_ID')
+# patient_CSC_mono <- left_join(patient_CSC_mono, pre_chemo, by = 'PERSON_ID')
+
+
+
+
+pre_TKI_ALK <- left_join(select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), select(TKI_ALK, PERSON_ID, DRUG_EXPOSURE_START_DATE, DRUG_EXPOSURE_END_DATE), by ='PERSON_ID') 
+pre_TKI_ALK <- unique(pre_TKI_ALK)
+pre_TKI_ALK <- pre_TKI_ALK %>%
+  filter(!is.na(TARGET))
+
+pre_TKI_ALK <- pre_TKI_ALK %>%
+  mutate(
+    DRUG_EXPOSURE_START_DATE = as.Date(DRUG_EXPOSURE_START_DATE),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  ) %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    pre_TKI_ALK = if_else(any(DRUG_EXPOSURE_START_DATE <= COHORT_START_DATE & 
+                              DRUG_EXPOSURE_START_DATE >= COHORT_START_DATE - 180), 1, 0)
+  ) %>%
+  ungroup()
+
+pre_TKI_ALK <- select(pre_TKI_ALK, PERSON_ID, pre_TKI_ALK)
+pre_TKI_ALK <- unique(pre_TKI_ALK)
+pre_TKI_ALK <- pre_TKI_ALK %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+
+patient_mono <- left_join(patient_mono, pre_TKI_ALK, by = 'PERSON_ID')                      
+# patient_CSAI_mono <- left_join(patient_CSAI_mono, pre_TKI_ALK, by = 'PERSON_ID')
+# patient_CSC_mono <- left_join(patient_CSC_mono, pre_TKI_ALK, by = 'PERSON_ID')
+
+
+
+
+
+patient_mono <- patient_mono %>%
+  rowwise() %>%
+  mutate(
+    ICI_dupl = if_else(sum(pembrolizumab_use, nivolumab_use, atezolizumab_use, durvalumab_use) >= 2, 1, 0)
+  ) %>%
+  ungroup()
+
+
+
+
+
+
+
+
+
+
+
+
+
+#2) Time-dependent data prep-------------------------------------------------------------------------
+
+#2-1)
+# ## 환자군: Index_ICI_days 기준 최대 prescrib 정의(1~7)
+# ## 대조군: ICI_use_days 기준 최대 prescrib 정의
+
+
+#### 2024.07.16.prescrib 정의를 2년까지로 제한하고 세분화함, ICI개시 2년 이후 steroid 사용은 제외
+#       TARGET == 1 & Index_ICI_days < 30 ~ 1,
+#       TARGET == 1 & Index_ICI_days >= 30 & Index_ICI_days < 60 ~ 2,
+#       TARGET == 1 & Index_ICI_days >= 60 & Index_ICI_days < 120 ~ 3,
+#       TARGET == 1 & Index_ICI_days >= 120 & Index_ICI_days < 180 ~ 4,
+#       TARGET == 1 & Index_ICI_days >= 180 & Index_ICI_days < 270 ~ 5,
+#       TARGET == 1 & Index_ICI_days >= 270 & Index_ICI_days < 365 ~ 6,
+#       TARGET == 1 & Index_ICI_days >= 365 & Index_ICI_days < 545 ~ 7,
+#       TARGET == 1 & Index_ICI_days >= 545 & Index_ICI_days < 730 ~ 8,
+#       TARGET == 1 & Index_ICI_days >= 730 ~ 9,
+#       TARGET == 0 & ICI_use_days < 30 ~ 1,
+
+
+
+
+
+patient_mono <- patient_mono %>%
+  mutate(
+    ad_steroid = case_when(
+      TARGET == 1 & Index_ICI_days < 30 ~ 1,
+      TARGET == 1 & Index_ICI_days >= 30 & Index_ICI_days < 60 ~ 2,
+      TARGET == 1 & Index_ICI_days >= 60 & Index_ICI_days < 120 ~ 3,
+      TARGET == 1 & Index_ICI_days >= 120 & Index_ICI_days < 180 ~ 4,
+      TARGET == 1 & Index_ICI_days >= 180 & Index_ICI_days < 270 ~ 5,
+      TARGET == 1 & Index_ICI_days >= 270 & Index_ICI_days < 365 ~ 6,
+      TARGET == 1 & Index_ICI_days >= 365 & Index_ICI_days < 545 ~ 7,
+      # 24.12. 변경 -> 730 관찰기간 + 60일 window 고려해서 790일까지를 8로 부여
+      TARGET == 1 & Index_ICI_days >= 545 & Index_ICI_days < 790 ~ 8,
+      TARGET == 1 & Index_ICI_days >= 790 ~ 9))
+
+
+
+
+patient_mono <- patient_mono %>%
+  mutate(
+    ICI_prescrib = case_when(
+      TARGET == 1 & ICI_use_days < 30 ~ 1,
+      TARGET == 1 & ICI_use_days >= 30 & ICI_use_days < 60 ~ 2,
+      TARGET == 1 & ICI_use_days >= 60 & ICI_use_days < 120 ~ 3,
+      TARGET == 1 & ICI_use_days >= 120 & ICI_use_days < 180 ~ 4,
+      TARGET == 1 & ICI_use_days >= 180 & ICI_use_days < 270 ~ 5,
+      TARGET == 1 & ICI_use_days >= 270 & ICI_use_days < 365 ~ 6,
+      TARGET == 1 & ICI_use_days >= 365 & ICI_use_days < 545 ~ 7,
+      TARGET == 1 & ICI_use_days >= 545 & ICI_use_days < 730 ~ 8,
+      TARGET == 1 & ICI_use_days >= 730 ~ 9,
+      TARGET == 0 & ICI_use_days < 30 ~ 1,
+      TARGET == 0 & ICI_use_days >= 30 & ICI_use_days < 60 ~ 2,
+      TARGET == 0 & ICI_use_days >= 60 & ICI_use_days < 120 ~ 3,
+      TARGET == 0 & ICI_use_days >= 120 & ICI_use_days < 180 ~ 4,
+      TARGET == 0 & ICI_use_days >= 180 & ICI_use_days < 270 ~ 5,
+      TARGET == 0 & ICI_use_days >= 270 & ICI_use_days < 365 ~ 6,
+      TARGET == 0 & ICI_use_days >= 365 & ICI_use_days < 545 ~ 7,
+      TARGET == 0 & ICI_use_days >= 545 & ICI_use_days < 730 ~ 8,
+      TARGET == 0 & ICI_use_days >= 730 ~ 9
+    )
+  )
+
+
+patient_mono <- patient_mono %>%
+  mutate(
+    ICI_prescrib_TDPS = pmax(ICI_prescrib, ad_steroid, na.rm = TRUE)
+  )
+
+
+
+
+patient_mono_time <- patient_mono %>%
+  uncount(weights = ICI_prescrib_TDPS, .remove = FALSE)  
+
+# 이전버전 코드-돌리지 말것
+# patient_mono_time <- patient_mono_time %>%
+#   mutate(ad_steroid = if_else(TARGET == 1, ICI_prescrib_TDPS, NA))
+
+
+patient_mono_time <- patient_mono_time %>%
+  group_by(PERSON_ID) %>%  
+  mutate(ICI_prescrib_TDPS = row_number()) %>%  # 각 그룹 내에서 행 번호를 새롭게 할당
+  ungroup() 
+
+
+
+
+#2-2)
+# ##  prescrib 숫자+1만큼 아래 코드 순차적으로 실행하는 loop 
+# 1> 1개월 미만 => 이전 가장 entry 날짜에 가까운,(new-use)기준 변수 정의 적용 & FIXED 변수 정의
+# 2> 1개월 이상~3개월 미만 => entry+30days 이내 가장 +30days에 가까운
+# 3> 3개월 이상~6개월 미만 => entry+30 ~ 90days 이내 가장 +90days에 가까운
+#       TARGET == 1 & Index_ICI_days < 30 ~ 1,
+#       TARGET == 1 & Index_ICI_days >= 30 & Index_ICI_days < 60 ~ 2,
+#       TARGET == 1 & Index_ICI_days >= 60 & Index_ICI_days < 120 ~ 3,
+#       TARGET == 1 & Index_ICI_days >= 120 & Index_ICI_days < 180 ~ 4,
+#       TARGET == 1 & Index_ICI_days >= 180 & Index_ICI_days < 270 ~ 5,
+#       TARGET == 1 & Index_ICI_days >= 270 & Index_ICI_days < 365 ~ 6,
+#       TARGET == 1 & Index_ICI_days >= 365 & Index_ICI_days < 545 ~ 7,
+#       TARGET == 1 & Index_ICI_days >= 545 & Index_ICI_days < 730 ~ 8,
+#       TARGET == 1 & Index_ICI_days >= 730 ~ 9,
+#       TARGET == 0 & ICI_use_days < 30 ~ 1,
+
+
+###
+
+#Sepsis
+
+sepsis <- left_join(sepsis, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+
+sepsis <- sepsis %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_sepsis_days = as.numeric(difftime(CONDITION_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+
+sepsis <- sepsis %>%
+  mutate(
+    Sepsis_occur = case_when(
+      Index_sepsis_days >= -365 & Index_sepsis_days < 0 ~ 1,
+      Index_sepsis_days >= 0 & Index_sepsis_days < 30 ~ 2,
+      Index_sepsis_days >= 30 & Index_sepsis_days < 60 ~ 3,
+      Index_sepsis_days >= 60 & Index_sepsis_days < 120 ~ 4,
+      Index_sepsis_days >= 120 & Index_sepsis_days < 180 ~ 5,
+      Index_sepsis_days >= 180 & Index_sepsis_days < 270 ~ 6,
+      Index_sepsis_days >= 270 & Index_sepsis_days < 365~ 7,
+      Index_sepsis_days >= 365 & Index_sepsis_days < 545~ 8,
+      Index_sepsis_days >= 545 & Index_sepsis_days < 730~ 9
+    )
+  )
+
+
+
+sepsis <- sepsis %>%
+  group_by(PERSON_ID, Sepsis_occur) %>%
+  filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
+  ungroup()
+
+patient_mono_time <- left_join(patient_mono_time, select(sepsis, c('PERSON_ID', 'Sepsis_occur')), by = 'PERSON_ID')
+patient_mono_time <- patient_mono_time %>%
+  mutate(Sepsis = if_else(is.na(Sepsis_occur), 
+                          0, 
+                          if_else(Sepsis_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time <- select(patient_mono_time, -Sepsis_occur)
+patient_mono_time <- unique(patient_mono_time)
+
+
+
+
+#Pneumonitis
+pneumonitis <- left_join(pneumonitis, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+
+pneumonitis <- pneumonitis %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_pneumonitis_days = as.numeric(difftime(CONDITION_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+pneumonitis <- pneumonitis %>%
+  mutate(
+    Pneumonitis_occur = case_when(
+      Index_pneumonitis_days >= -365 & Index_pneumonitis_days < 0 ~ 1,
+      Index_pneumonitis_days >= 0 & Index_pneumonitis_days < 30 ~ 2,
+      Index_pneumonitis_days >= 30 & Index_pneumonitis_days < 60 ~ 3,
+      Index_pneumonitis_days >= 60 & Index_pneumonitis_days < 120 ~ 4,
+      Index_pneumonitis_days >= 120 & Index_pneumonitis_days < 180 ~ 5,
+      Index_pneumonitis_days >= 180 & Index_pneumonitis_days < 270 ~ 6,
+      Index_pneumonitis_days >= 270 & Index_pneumonitis_days < 365 ~ 7,
+      Index_pneumonitis_days >= 365 & Index_pneumonitis_days < 545 ~ 8,
+      Index_pneumonitis_days >= 545 & Index_pneumonitis_days < 730 ~ 9
+    )
+  )
+
+pneumonitis <- pneumonitis %>%
+  group_by(PERSON_ID, Pneumonitis_occur) %>%
+  filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
+  ungroup()
+
+pneumonitis <- pneumonitis %>%
+  group_by(PERSON_ID) %>%
+  filter(Pneumonitis_occur == min(Pneumonitis_occur)) %>%
+  ungroup()
+
+pneumonitis <- pneumonitis %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+
+pneumonitis <- na.omit(pneumonitis, subset = "Pneumonitis_occur")
+
+patient_mono_time <- left_join(patient_mono_time, select(pneumonitis, c('PERSON_ID', 'Pneumonitis_occur')), by = 'PERSON_ID')
+patient_mono_time <- patient_mono_time %>%
+  mutate(Pneumonitis = if_else(is.na(Pneumonitis_occur), 
+                          0, 
+                          if_else(Pneumonitis_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time <- select(patient_mono_time, -Pneumonitis_occur)
+
+
+
+
+#Dyspnea
+dyspnea <- left_join(dyspnea, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+
+dyspnea <- dyspnea %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_dyspnea_days = as.numeric(difftime(CONDITION_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+dyspnea <- dyspnea %>%
+  mutate(
+    dyspnea_occur = case_when(
+      Index_dyspnea_days >= -365 & Index_dyspnea_days < 0 ~ 1,
+      Index_dyspnea_days >= 0 & Index_dyspnea_days < 30 ~ 2,
+      Index_dyspnea_days >= 30 & Index_dyspnea_days < 60 ~ 3,
+      Index_dyspnea_days >= 60 & Index_dyspnea_days < 120 ~ 4,
+      Index_dyspnea_days >= 120 & Index_dyspnea_days < 180 ~ 5,
+      Index_dyspnea_days >= 180 & Index_dyspnea_days < 270 ~ 6,
+      Index_dyspnea_days >= 270 & Index_dyspnea_days < 365 ~ 7,
+      Index_dyspnea_days >= 365 & Index_dyspnea_days < 545 ~ 8,
+      Index_dyspnea_days >= 545 & Index_dyspnea_days < 730 ~ 9
+    )
+  )
+
+dyspnea <- dyspnea %>%
+  group_by(PERSON_ID, dyspnea_occur) %>%
+  filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
+  ungroup()
+
+dyspnea$ICI_prescrib_TDPS <- dyspnea$dyspnea_occur
+
+dyspnea <- dyspnea %>%
+  distinct(PERSON_ID, dyspnea_occur, .keep_all = TRUE)
+
+dyspnea <- na.omit(dyspnea, subset = "dyspnea_occur")
+
+
+patient_mono_time <- left_join(patient_mono_time, select(dyspnea, c('PERSON_ID', 'dyspnea_occur','ICI_prescrib_TDPS')), by = c('PERSON_ID','ICI_prescrib_TDPS'))
+patient_mono_time <- patient_mono_time %>%
+  mutate(Dyspnea = if_else(is.na(dyspnea_occur), 
+                          0, 
+                          1))
+patient_mono_time <- select(patient_mono_time, -dyspnea_occur)
+
+
+
+
+
+# RT_GKS
+CSC_RT_GKS <- left_join(CSC_RT_GKS, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+RT_GKS <- CSC_RT_GKS %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_RT_days = as.numeric(difftime(PROCEDURE_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+RT_GKS <- RT_GKS %>%
+  mutate(
+    RT_occur = case_when(
+      Index_RT_days >= -180 & Index_RT_days < 0 ~ 1,
+      Index_RT_days >= 0 & Index_RT_days < 30 ~ 2,
+      Index_RT_days >= 30 & Index_RT_days < 60 ~ 3,
+      Index_RT_days >= 60 & Index_RT_days < 120 ~ 4,
+      Index_RT_days >= 120 & Index_RT_days < 180 ~ 5,
+      Index_RT_days >= 180 & Index_RT_days < 270 ~ 6,
+      Index_RT_days >= 270 & Index_RT_days < 365 ~ 7,
+      Index_RT_days >= 365 & Index_RT_days < 545 ~ 8,
+      Index_RT_days >= 545 & Index_RT_days < 730 ~ 9
+    )
+  )
+
+RT_GKS <- RT_GKS %>%
+  group_by(PERSON_ID, RT_occur) %>%
+  filter(PROCEDURE_DATE == max(PROCEDURE_DATE)) %>%
+  ungroup()
+
+RT_GKS$ICI_prescrib_TDPS <- RT_GKS$RT_occur
+
+RT_GKS <- RT_GKS %>%
+  distinct(PERSON_ID, RT_occur, .keep_all = TRUE)
+
+RT_GKS <- na.omit(RT_GKS, subset = "RT_occur")
+
+
+patient_mono_time <- left_join(patient_mono_time, select(RT_GKS, c('PERSON_ID', 'RT_occur','ICI_prescrib_TDPS')), by = c('PERSON_ID','ICI_prescrib_TDPS'))
+patient_mono_time <- patient_mono_time %>%
+  mutate(RT_GKS = if_else(is.na(RT_occur), 
+                          0, 
+                          1))
+patient_mono_time <- select(patient_mono_time, -RT_occur)
+
+
+
+
+
+
+# Brain metastasis
+brainmeta <- left_join(brainmeta, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+
+brainmeta <- brainmeta %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_brainmeta_days = as.numeric(difftime(CONDITION_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+brainmeta <- brainmeta %>%
+  mutate(
+    brainmeta_occur = case_when(
+      Index_brainmeta_days >= -365 & Index_brainmeta_days < 0 ~ 1,
+      Index_brainmeta_days >= 0 & Index_brainmeta_days < 30 ~ 2,
+      Index_brainmeta_days >= 30 & Index_brainmeta_days < 60 ~ 3,
+      Index_brainmeta_days >= 60 & Index_brainmeta_days < 120 ~ 4,
+      Index_brainmeta_days >= 120 & Index_brainmeta_days < 180 ~ 5,
+      Index_brainmeta_days >= 180 & Index_brainmeta_days < 270 ~ 6,
+      Index_brainmeta_days >= 270 & Index_brainmeta_days < 365 ~ 7,
+      Index_brainmeta_days >= 365 & Index_brainmeta_days < 545 ~ 8,
+      Index_brainmeta_days >= 545 & Index_brainmeta_days < 730 ~ 9
+    )
+  )
+
+brainmeta <- brainmeta %>%
+  group_by(PERSON_ID, brainmeta_occur) %>%
+  # filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
+  filter(CONDITION_START_DATE == min(CONDITION_START_DATE)) %>%
+  ungroup()
+
+brainmeta <- brainmeta %>%
+  group_by(PERSON_ID) %>%
+  filter(brainmeta_occur == min(brainmeta_occur)) %>%
+  ungroup()
+
+brainmeta <- brainmeta %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+
+brainmeta <- na.omit(brainmeta, subset = "brainmeta_occur")
+
+patient_mono_time <- left_join(patient_mono_time, select(brainmeta, c('PERSON_ID', 'brainmeta_occur')), by = 'PERSON_ID')
+patient_mono_time <- patient_mono_time %>%
+  mutate(Brainmeta = if_else(is.na(brainmeta_occur), 
+                          0, 
+                          if_else(brainmeta_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time <- select(patient_mono_time, -brainmeta_occur)
+
+
+
+
+
+
+#Bone metastasis
+bonemeta <- left_join(bonemeta, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+
+bonemeta <- bonemeta %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_bonemeta_days = as.numeric(difftime(CONDITION_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+bonemeta <- bonemeta %>%
+  mutate(
+    bonemeta_occur = case_when(
+      Index_bonemeta_days >= -365 & Index_bonemeta_days < 0 ~ 1,
+      Index_bonemeta_days >= 0 & Index_bonemeta_days < 30 ~ 2,
+      Index_bonemeta_days >= 30 & Index_bonemeta_days < 60 ~ 3,
+      Index_bonemeta_days >= 60 & Index_bonemeta_days < 120 ~ 4,
+      Index_bonemeta_days >= 120 & Index_bonemeta_days < 180 ~ 5,
+      Index_bonemeta_days >= 180 & Index_bonemeta_days < 270 ~ 6,
+      Index_bonemeta_days >= 270 & Index_bonemeta_days < 365 ~ 7,
+      Index_bonemeta_days >= 365 & Index_bonemeta_days < 545 ~ 8,
+      Index_bonemeta_days >= 545 & Index_bonemeta_days < 730 ~ 9
+    )
+  )
+
+bonemeta <- bonemeta %>%
+  group_by(PERSON_ID, bonemeta_occur) %>%
+  # filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
+  filter(CONDITION_START_DATE == min(CONDITION_START_DATE)) %>%
+  ungroup()
+
+bonemeta <- bonemeta %>%
+  group_by(PERSON_ID) %>%
+  filter(bonemeta_occur == min(bonemeta_occur)) %>%
+  ungroup()
+
+bonemeta <- bonemeta %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+
+bonemeta <- na.omit(bonemeta, subset = "bonemeta_occur")
+
+patient_mono_time <- left_join(patient_mono_time, select(bonemeta, c('PERSON_ID', 'bonemeta_occur')), by = 'PERSON_ID')
+patient_mono_time <- patient_mono_time %>%
+  mutate(Bonemeta = if_else(is.na(bonemeta_occur), 
+                          0, 
+                          if_else(bonemeta_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time <- select(patient_mono_time, -bonemeta_occur)
+
+
+
+
+
+#Liver metastasis
+livermeta <- left_join(livermeta, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+
+livermeta <- livermeta %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_livermeta_days = as.numeric(difftime(CONDITION_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+livermeta <- livermeta %>%
+  mutate(
+    livermeta_occur = case_when(
+      Index_livermeta_days >= -365 & Index_livermeta_days < 0 ~ 1,
+      Index_livermeta_days >= 0 & Index_livermeta_days < 30 ~ 2,
+      Index_livermeta_days >= 30 & Index_livermeta_days < 60 ~ 3,
+      Index_livermeta_days >= 60 & Index_livermeta_days < 120 ~ 4,
+      Index_livermeta_days >= 120 & Index_livermeta_days < 180 ~ 5,
+      Index_livermeta_days >= 180 & Index_livermeta_days < 270 ~ 6,
+      Index_livermeta_days >= 270 & Index_livermeta_days < 365 ~ 7,
+      Index_livermeta_days >= 365 & Index_livermeta_days < 545 ~ 8,
+      Index_livermeta_days >= 545 & Index_livermeta_days < 730 ~ 9
+    )
+  )
+
+livermeta <- livermeta %>%
+  group_by(PERSON_ID, livermeta_occur) %>%
+  # filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
+  filter(CONDITION_START_DATE == min(CONDITION_START_DATE)) %>%
+  ungroup()
+
+livermeta <- livermeta %>%
+  group_by(PERSON_ID) %>%
+  filter(livermeta_occur == min(livermeta_occur)) %>%
+  ungroup()
+
+livermeta <- livermeta %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+
+livermeta <- na.omit(livermeta, subset = "livermeta_occur")
+
+patient_mono_time <- left_join(patient_mono_time, select(livermeta, c('PERSON_ID', 'livermeta_occur')), by = 'PERSON_ID')
+patient_mono_time <- patient_mono_time %>%
+  mutate(Livermeta = if_else(is.na(livermeta_occur), 
+                          0, 
+                          if_else(livermeta_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time <- select(patient_mono_time, -livermeta_occur)
+
+
+
+
+
+
+# 암 등록 자료 & metastasis_all integration (2024.10.04.)
+### covariate으로 전이여부만 판정
+####>> 진단코드로 정의불가해서 포기(2024.10.) outcome 정의: 암 등록 자료 및 entry_date(ICI 첫 사용 시작, cohort_start_date) 1년 전까지는 없었던 "새로운 전이" detection
+cancer_reg <- cancer_reg_final[,-(2:4)]
+colnames(cancer_reg)
+cancer_reg <- unique(cancer_reg)
+cancer_reg <- cancer_reg %>%
+  filter(is.na(VALUE_AS_STRING.y) != TRUE | is.na(VALUE_AS_STRING) != TRUE)
+cancer_reg <- cancer_reg[!grepl("M0", cancer_reg$VALUE_AS_STRING.y), ]
+cancer_reg <- cancer_reg %>%
+  mutate(reg_meta_history = 1)
+cancer_reg <- cancer_reg[,-(2:4)]
+cancer_reg <- unique(cancer_reg)
+
+cancer_reg <- cancer_reg %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    meta1 = ifelse(OBSERVATION_SOURCE_VALUE == "metacode1", VALUE_AS_STRING, NA),
+    meta2 = ifelse(OBSERVATION_SOURCE_VALUE == "metacode2", VALUE_AS_STRING, NA),
+    meta3 = ifelse(OBSERVATION_SOURCE_VALUE == "metacode3", VALUE_AS_STRING, NA)
+  ) %>%
+  ungroup()
+cancer_reg <- cancer_reg[,-(2:4)]
+cancer_reg <- unique(cancer_reg)
+cancer_reg <- cancer_reg %>%
+  group_by(PERSON_ID) %>%
+  summarise(
+    meta1 = na.omit(meta1)[1],
+    meta2 = na.omit(meta2)[1],
+    meta3 = na.omit(meta3)[1],
+    reg_meta_history = first(reg_meta_history)
+  ) %>%
+  ungroup()
+
+
+
+
+metastasis_kcd <- read.csv("metastasis_all_kcd.csv")
+metastasis_kcd <- unique(metastasis_kcd)
+
+
+metastasis_kcd <- metastasis_kcd %>%
+  group_by(condition_concept_id) %>%
+  filter(
+    if(any(ext_cond_source_value_kcd != "NULL")){
+      ext_cond_source_value_kcd != "NULL"
+    }else{
+      TRUE
+    }
+  ) %>% ungroup()
+
+metastasis_kcd <- metastasis_kcd %>%
+  mutate(meta_source = substr(ext_cond_source_value_kcd, 1, 4))
+metastasis_kcd <- metastasis_kcd[,-(2:3)]
+metastasis_kcd <- unique(metastasis_kcd)
+#### --------------------metastasis_kcd와 암등록자료의 metacode KCD가 모두 겹치지 않음을 확인 (24.10.04.)
+
+## M1a~b에 해당하는 전이
+# 254591	94391008	Secondary malignant neoplasm of lung
+# 72266	94493005	Secondary malignant neoplasm of pleura
+# 4248199	94484009	Secondary malignant neoplasm of pericardium
+# 439751	94351005	Secondary malignant neoplasm of intrathoracic lymph nodes
+# 4248061	94352003	Secondary malignant neoplasm of intrathoracic organs
+# 4312284	94233006	Secondary malignant neoplasm of bronchus
+
+## M1c1,c2에 해당하는 전이: 그 외
+
+
+
+colnames(cancer_primary)
+cancer_primary <- unique(select(cancer_primary, PERSON_ID, CONDITION_CONCEPT_ID, CONDITION_START_DATE, CONDITION_END_DATE, EXT_COND_SOURCE_VALUE_KCD))
+cancer_primary <- cancer_primary %>%
+  group_by(PERSON_ID, CONDITION_CONCEPT_ID) %>%
+  slice_min(CONDITION_START_DATE) %>%
+  ungroup()
+#### lung cancer 이외에는 모두 제외되었음을 확인 (2024.10.04.)
+
+
+
+
+## 2024.10.04. "NEW" metastasis outcome dataset: "metastasis_all"을 사용 => concept_id 별로 가장 빠른 날짜 기준으로 index date와 비교.
+##(3의 outcome 코드에서 처리)
+
+
+
+
+
+
+
+#metastasis "COVARIATES" 24.10.02.
+metastasis_all  <- left_join(metastasis_all , select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+
+
+
+metastasis <- metastasis_all %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_metastasis_days = as.numeric(difftime(CONDITION_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+metastasis <- metastasis %>%
+  mutate(
+    metastasis_occur = case_when(
+      Index_metastasis_days >= -365 & Index_metastasis_days < 0 ~ 1,
+      Index_metastasis_days >= 0 & Index_metastasis_days < 30 ~ 2,
+      Index_metastasis_days >= 30 & Index_metastasis_days < 60 ~ 3,
+      Index_metastasis_days >= 60 & Index_metastasis_days < 120 ~ 4,
+      Index_metastasis_days >= 120 & Index_metastasis_days < 180 ~ 5,
+      Index_metastasis_days >= 180 & Index_metastasis_days < 270 ~ 6,
+      Index_metastasis_days >= 270 & Index_metastasis_days < 365 ~ 7,
+      Index_metastasis_days >= 365 & Index_metastasis_days < 545 ~ 8,
+      Index_metastasis_days >= 545 & Index_metastasis_days < 730 ~ 9
+    )
+  )
+
+metastasis <- metastasis %>%
+  group_by(PERSON_ID, metastasis_occur) %>%
+  # filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
+  filter(CONDITION_START_DATE == min(CONDITION_START_DATE)) %>%
+  ungroup()
+
+metastasis <- metastasis %>%
+  group_by(PERSON_ID) %>%
+  filter(metastasis_occur == min(metastasis_occur)) %>%
+  ungroup()
+
+metastasis <- metastasis %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+
+metastasis <- na.omit(metastasis, subset = "metastasis_occur")
+
+#24.10.04. Metastasis 보강 - 암등록자료
+metastasis <- left_join(metastasis, select(cancer_reg, PERSON_ID, reg_meta_history), by = "PERSON_ID")
+metastasis <- metastasis %>%
+  mutate(metastasis_occur_new = metastasis_occur)
+metastasis <- metastasis %>%
+  mutate(metastasis_occur = ifelse(!is.na(reg_meta_history), 1, metastasis_occur))
+
+
+patient_mono_time <- left_join(patient_mono_time, select(metastasis, c('PERSON_ID', 'metastasis_occur')), by = 'PERSON_ID')
+patient_mono_time <- patient_mono_time %>%
+  mutate(metastasis = if_else(is.na(metastasis_occur), 
+                          0, 
+                          if_else(metastasis_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time <- select(patient_mono_time, -metastasis_occur)
+
+
+
+
+
+
+
+
+# Age
+patient_mono_time <- left_join(patient_mono_time, select(sexbirth, c(PERSON_ID, YEAR_OF_BIRTH, MONTH_OF_BIRTH)), by = 'PERSON_ID')
+
+patient_mono_time <- patient_mono_time %>%
+  mutate(
+    age = case_when(
+      ICI_prescrib_TDPS == 1 ~ year(COHORT_START_DATE) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0),
+      ICI_prescrib_TDPS == 2 ~ year(COHORT_START_DATE+days(30)) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0),
+      ICI_prescrib_TDPS == 3 ~ year(COHORT_START_DATE+days(60)) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0),
+      ICI_prescrib_TDPS == 4 ~ year(COHORT_START_DATE+days(120)) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0),
+      ICI_prescrib_TDPS == 5 ~ year(COHORT_START_DATE+days(180)) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0),
+      ICI_prescrib_TDPS == 6 ~ year(COHORT_START_DATE+days(270)) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0),
+      ICI_prescrib_TDPS == 7 ~ year(COHORT_START_DATE+days(365)) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0),
+      ICI_prescrib_TDPS == 8 ~ year(COHORT_START_DATE+days(545)) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0),
+      ICI_prescrib_TDPS == 9 ~ year(COHORT_START_DATE+days(730)) - YEAR_OF_BIRTH - if_else(month(COHORT_START_DATE) < MONTH_OF_BIRTH | (month(COHORT_START_DATE) == MONTH_OF_BIRTH & day(COHORT_START_DATE) < 1), 1, 0)
+    )
+  )
+
+
+
+patient_mono_time <- select(patient_mono_time, -c(YEAR_OF_BIRTH, MONTH_OF_BIRTH))
+
+
+
+
+
+
+
+
+
+#1-2) BMI
+height <- left_join(height, select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by ='PERSON_ID')
+height <- unique(height)
+height <- height %>%
+  filter(!is.na(TARGET))
+height <- height %>%
+  mutate(
+    MEASUREMENT_DATE = as.Date(MEASUREMENT_DATE),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  )
+
+weight <- left_join(weight, select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by ='PERSON_ID')
+weight <- unique(weight)
+weight <- weight %>%
+  filter(!is.na(TARGET))
+weight <- weight %>%
+  mutate(
+    MEASUREMENT_DATE = as.Date(MEASUREMENT_DATE),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  )
+
+
+BMI <- left_join(select(patient_mono, PERSON_ID), select(weight, PERSON_ID, MEASUREMENT_DATE, VALUE_AS_NUMBER), by = 'PERSON_ID')
+BMI <- full_join(BMI, select(height, PERSON_ID, MEASUREMENT_DATE, VALUE_AS_NUMBER), by = 'PERSON_ID')
+BMI$MEASUREMENT_DATE.x <- as.Date(BMI$MEASUREMENT_DATE.x)
+BMI$MEASUREMENT_DATE.y <- as.Date(BMI$MEASUREMENT_DATE.y)
+
+# Filter rows where the dates are exactly the same
+BMI <- BMI[abs(difftime(BMI$MEASUREMENT_DATE.x, BMI$MEASUREMENT_DATE.y, units = "days")) < 90, ]
+BMI <- unique(BMI)
+
+BMI <- BMI %>%
+  mutate(BMI_cal = ifelse(!is.na(VALUE_AS_NUMBER.y) | !is.na(VALUE_AS_NUMBER.x), VALUE_AS_NUMBER.x / ((VALUE_AS_NUMBER.y/100)^2), NA))
+
+
+
+BMI <- left_join(BMI, select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by ='PERSON_ID')
+BMI <- BMI %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_BMI_days = as.numeric(difftime(MEASUREMENT_DATE.x, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+BMI <- BMI %>%
+  mutate(
+    BMI_occur = case_when(
+      Index_BMI_days >= -365 & Index_BMI_days < 0 ~ 1,
+      Index_BMI_days >= 0 & Index_BMI_days < 30 ~ 2,
+      Index_BMI_days >= 30 & Index_BMI_days < 60 ~ 3,
+      Index_BMI_days >= 60 & Index_BMI_days < 120 ~ 4,
+      Index_BMI_days >= 120 & Index_BMI_days < 180 ~ 5,
+      Index_BMI_days >= 180 & Index_BMI_days < 270 ~ 6,
+      Index_BMI_days >= 270 & Index_BMI_days < 365 ~ 7,
+      Index_BMI_days >= 365 & Index_BMI_days < 545 ~ 8,
+      Index_BMI_days >= 545 & Index_BMI_days < 730 ~ 9
+    )
+  )
+
+BMI <- BMI %>%
+  group_by(PERSON_ID, BMI_occur) %>%
+  filter(MEASUREMENT_DATE.x == max(MEASUREMENT_DATE.x)) %>%
+  ungroup()
+
+BMI <- BMI %>%
+  group_by(PERSON_ID, BMI_occur) %>%
+  filter(abs(difftime(MEASUREMENT_DATE.x, MEASUREMENT_DATE.y, units = "days")) == 
+           min(abs(difftime(MEASUREMENT_DATE.x, MEASUREMENT_DATE.y, units = "days")), na.rm = TRUE)) %>%
+  ungroup()
+
+BMI <- unique(BMI)
+
+BMI <- BMI %>%
+  filter(!is.na(BMI_occur))
+
+BMI <- BMI %>%
+  distinct(PERSON_ID, BMI_occur, .keep_all = TRUE)
+
+
+BMI$ICI_prescrib_TDPS <- BMI$BMI_occur
+###250318 weight 변수 추가
+patient_mono_time <- left_join(patient_mono_time, select(BMI, PERSON_ID, ICI_prescrib_TDPS, BMI_cal, VALUE_AS_NUMBER.x), by = c('PERSON_ID', 'ICI_prescrib_TDPS'))
+
+patient_mono_time <- patient_mono_time %>%
+  mutate(weight = VALUE_AS_NUMBER.x)
+patient_mono_time <- select(patient_mono_time, -VALUE_AS_NUMBER.x)
+
+
+# 1-4) tumor marker -> Time-dependent variables
+# CEA: 36313717,4244721
+# cytokeratin: 3000659
+# unit value: ng/mL
+
+cytokeratin <- left_join(select(cytokeratin, PERSON_ID, MEASUREMENT_DATETIME, VALUE_AS_NUMBER), select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by ='PERSON_ID')
+cytokeratin <- unique(cytokeratin)
+cytokeratin <- cytokeratin %>%
+  filter(!is.na(TARGET))
+
+cytokeratin <- cytokeratin %>%
+  mutate(
+    MEASUREMENT_DATETIME = as.Date(MEASUREMENT_DATETIME),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  )
+
+cytokeratin <- cytokeratin %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_cytokeratin_days = as.numeric(difftime(MEASUREMENT_DATETIME, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+cytokeratin <- cytokeratin %>%
+  mutate(
+    cytokeratin_occur = case_when(
+      Index_cytokeratin_days >= -365 & Index_cytokeratin_days < 0 ~ 1,
+      Index_cytokeratin_days >= 0 & Index_cytokeratin_days < 30 ~ 2,
+      Index_cytokeratin_days >= 30 & Index_cytokeratin_days < 60 ~ 3,
+      Index_cytokeratin_days >= 60 & Index_cytokeratin_days < 120 ~ 4,
+      Index_cytokeratin_days >= 120 & Index_cytokeratin_days < 180 ~ 5,
+      Index_cytokeratin_days >= 180 & Index_cytokeratin_days < 270 ~ 6,
+      Index_cytokeratin_days >= 270 & Index_cytokeratin_days < 365 ~ 7,
+      Index_cytokeratin_days >= 365 & Index_cytokeratin_days < 545 ~ 8,
+      Index_cytokeratin_days >= 545 & Index_cytokeratin_days < 730 ~ 9
+    )
+  )
+
+cytokeratin <- cytokeratin %>%
+  group_by(PERSON_ID, cytokeratin_occur) %>%
+  filter(MEASUREMENT_DATETIME == max(MEASUREMENT_DATETIME)) %>%
+  ungroup()
+
+cytokeratin <- cytokeratin %>%
+  filter(!is.na(cytokeratin_occur))
+
+cytokeratin <- cytokeratin %>%
+  distinct(PERSON_ID, cytokeratin_occur, .keep_all = TRUE)
+
+cytokeratin$ICI_prescrib_TDPS <- cytokeratin$cytokeratin_occur
+cytokeratin$Cytokeratin <- cytokeratin$VALUE_AS_NUMBER
+patient_mono_time <- left_join(patient_mono_time, select(cytokeratin, PERSON_ID, ICI_prescrib_TDPS, Cytokeratin), by = c('PERSON_ID', 'ICI_prescrib_TDPS'))
+
+
+
+
+
+
+
+
+
+
+
+
+#1-3) CBC
+print(unique(CBC_lab$MEASUREMENT_CONCEPT_ID))
+
+ANC <- CBC_lab %>%
+  filter(MEASUREMENT_CONCEPT_ID == 3013650)
+# unit value: /㎕
+
+ANC <- left_join(select(ANC, PERSON_ID, MEASUREMENT_DATETIME, VALUE_AS_NUMBER), select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by ='PERSON_ID')
+ANC <- unique(ANC)
+ANC <- ANC %>%
+  filter(!is.na(TARGET))
+
+ANC <- ANC %>%
+  mutate(
+    MEASUREMENT_DATETIME = as.Date(MEASUREMENT_DATETIME),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  )
+
+ANC <- ANC %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_ANC_days = as.numeric(difftime(MEASUREMENT_DATETIME, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+ANC <- ANC %>%
+  mutate(
+    ANC_occur = case_when(
+      Index_ANC_days >= -365 & Index_ANC_days < 0 ~ 1,
+      Index_ANC_days >= 0 & Index_ANC_days < 30 ~ 2,
+      Index_ANC_days >= 30 & Index_ANC_days < 60 ~ 3,
+      Index_ANC_days >= 60 & Index_ANC_days < 120 ~ 4,
+      Index_ANC_days >= 120 & Index_ANC_days < 180 ~ 5,
+      Index_ANC_days >= 180 & Index_ANC_days < 270 ~ 6,
+      Index_ANC_days >= 270 & Index_ANC_days < 365 ~ 7,
+      Index_ANC_days >= 365 & Index_ANC_days < 545 ~ 8,
+      Index_ANC_days >= 545 & Index_ANC_days < 730 ~ 9
+    )
+  )
+
+ANC <- ANC %>%
+  group_by(PERSON_ID, ANC_occur) %>%
+  filter(MEASUREMENT_DATETIME == max(MEASUREMENT_DATETIME)) %>%
+  ungroup()
+
+ANC <- ANC %>%
+  filter(!is.na(ANC_occur))
+
+ANC <- ANC %>%
+  distinct(PERSON_ID, ANC_occur, .keep_all = TRUE)
+
+ANC$ICI_prescrib_TDPS <- ANC$ANC_occur
+ANC$ANC_lab <- ANC$VALUE_AS_NUMBER
+patient_mono_time <- left_join(patient_mono_time, select(ANC, PERSON_ID, ICI_prescrib_TDPS, ANC_lab), by = c('PERSON_ID', 'ICI_prescrib_TDPS'))
+
+
+
+
+
+
+
+
+
+
+
+#NLR
+
+Lymphocyte <- CBC_lab %>%
+  filter(MEASUREMENT_CONCEPT_ID == 3037511)
+# unit value: %
+Neutrophil <- CBC_lab %>%
+  filter(MEASUREMENT_CONCEPT_ID == 3017354)
+# unit value: %
+
+
+Lymphocyte <- left_join(select(Lymphocyte, PERSON_ID, MEASUREMENT_DATETIME, VALUE_AS_NUMBER), select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by ='PERSON_ID')
+Lymphocyte <- unique(Lymphocyte)
+Lymphocyte <- Lymphocyte %>%
+  filter(!is.na(TARGET))
+Lymphocyte <- Lymphocyte %>%
+  mutate(
+    MEASUREMENT_DATETIME = as.Date(MEASUREMENT_DATETIME),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  ) 
+
+Neutrophil <- left_join(select(Neutrophil, PERSON_ID, MEASUREMENT_DATETIME, VALUE_AS_NUMBER), select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by ='PERSON_ID')
+Neutrophil <- unique(Neutrophil)
+Neutrophil <- Neutrophil %>%
+  filter(!is.na(TARGET))
+Neutrophil <- Neutrophil %>%
+  mutate(
+    MEASUREMENT_DATETIME = as.Date(MEASUREMENT_DATETIME),
+    COHORT_START_DATE = as.Date(COHORT_START_DATE)
+  )
+
+
+NLR <- left_join(select(patient_mono, PERSON_ID), select(Lymphocyte, PERSON_ID, MEASUREMENT_DATETIME, VALUE_AS_NUMBER), by = 'PERSON_ID')
+NLR <- full_join(NLR, select(Neutrophil, PERSON_ID, MEASUREMENT_DATETIME, VALUE_AS_NUMBER), by = 'PERSON_ID')
+NLR$MEASUREMENT_DATETIME.x <- as.Date(NLR$MEASUREMENT_DATETIME.x)
+NLR$MEASUREMENT_DATETIME.y <- as.Date(NLR$MEASUREMENT_DATETIME.y)
+
+# Filter rows where the dates are exactly the same
+# NLR <- NLR[abs(difftime(NLR$MEASUREMENT_DATETIME.x, NLR$MEASUREMENT_DATETIME.y, units = "days")) < 3, ]
+NLR <- NLR[NLR$MEASUREMENT_DATETIME.x == NLR$MEASUREMENT_DATETIME.y, ]
+
+NLR <- unique(NLR)
+
+NLR <- NLR %>%
+  mutate(NLR_cal = ifelse(!is.na(VALUE_AS_NUMBER.y) | !is.na(VALUE_AS_NUMBER.x), (VALUE_AS_NUMBER.y/VALUE_AS_NUMBER.x), NA))
+#Neutrophil/Lymphocyt
+
+
+NLR <- left_join(NLR, select(patient_mono, PERSON_ID, COHORT_START_DATE, TARGET), by ='PERSON_ID')
+NLR <- NLR %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_NLR_days = as.numeric(difftime(MEASUREMENT_DATETIME.x, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+NLR <- NLR %>%
+  mutate(
+    NLR_occur = case_when(
+      Index_NLR_days >= -365 & Index_NLR_days < 0 ~ 1,
+      Index_NLR_days >= 0 & Index_NLR_days < 30 ~ 2,
+      Index_NLR_days >= 30 & Index_NLR_days < 60 ~ 3,
+      Index_NLR_days >= 60 & Index_NLR_days < 120 ~ 4,
+      Index_NLR_days >= 120 & Index_NLR_days < 180 ~ 5,
+      Index_NLR_days >= 180 & Index_NLR_days < 270 ~ 6,
+      Index_NLR_days >= 270 & Index_NLR_days < 365 ~ 7,
+      Index_NLR_days >= 365 & Index_NLR_days < 545 ~ 8,
+      Index_NLR_days >= 545 & Index_NLR_days < 730 ~ 9
+    )
+  )
+
+NLR <- NLR %>%
+  group_by(PERSON_ID, NLR_occur) %>%
+  filter(MEASUREMENT_DATETIME.x == max(MEASUREMENT_DATETIME.x)) %>%
+  ungroup()
+
+NLR <- unique(NLR)
+
+NLR <- NLR %>%
+  filter(!is.na(NLR_occur))
+
+NLR <- NLR %>%
+  distinct(PERSON_ID, NLR_occur, .keep_all = TRUE)
+
+
+NLR$ICI_prescrib_TDPS <- NLR$NLR_occur
+patient_mono_time <- left_join(patient_mono_time, select(NLR, PERSON_ID, ICI_prescrib_TDPS, NLR_cal), by = c('PERSON_ID', 'ICI_prescrib_TDPS'))
+
+
+
+
+
+# ICI period
+ICI_cycle$DRUG_EXPOSURE_START_DATE <- as.Date(ICI_cycle$DRUG_EXPOSURE_START_DATE)
+ICI_cycle$DRUG_EXPOSURE_END_DATE <- as.Date(ICI_cycle$DRUG_EXPOSURE_END_DATE)
+
+
+ICI_period <- left_join(select(patient_mono, PERSON_ID, COHORT_START_DATE), ICI_cycle, by = "PERSON_ID")
+
+ICI_period <- ICI_period %>%
+  arrange(PERSON_ID, DRUG_EXPOSURE_START_DATE) %>%
+  group_by(PERSON_ID) %>%
+  mutate(
+    next_start_date = lead(DRUG_EXPOSURE_START_DATE),
+    days_between = if_else(
+      is.na(next_start_date), 
+      NA_real_,  # 직접적으로 numeric NA를 사용
+      as.numeric(next_start_date - DRUG_EXPOSURE_END_DATE)  # 차이 계산 후 numeric으로 변환
+    ),
+    gap_over_60 = if_else(!is.na(days_between) & days_between >= 60 & days_between < 120, TRUE, FALSE)
+  ) %>%
+  ungroup()
+
+
+ICI_period <- ICI_period %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Day_From_Start = as.numeric(difftime(DRUG_EXPOSURE_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+ICI_period <- ICI_period %>%
+  mutate(
+    ICI_prescrib_TDPS = case_when(
+      Day_From_Start < 30 ~ 1,
+      Day_From_Start >= 30 & Day_From_Start < 60 ~ 2,
+      Day_From_Start >= 60 & Day_From_Start < 120 ~ 3,
+      Day_From_Start >= 120 & Day_From_Start < 180 ~ 4,
+      Day_From_Start >= 180 & Day_From_Start < 270 ~ 5,
+      Day_From_Start >= 270 & Day_From_Start < 365~ 6,
+      Day_From_Start >= 365 & Day_From_Start < 545~ 7,
+      Day_From_Start >= 545 & Day_From_Start < 730~ 8,
+      Day_From_Start >= 730 ~ 9
+    )
+  )
+
+
+
+ICI_period <- ICI_period %>%
+  filter(gap_over_60 == TRUE)
+
+ICI_period <- ICI_period %>%
+  distinct(PERSON_ID, ICI_prescrib_TDPS, .keep_all = TRUE)
+
+patient_mono_time <- left_join(patient_mono_time, select(ICI_period, PERSON_ID, ICI_prescrib_TDPS, gap_over_60), by = c('PERSON_ID', 'ICI_prescrib_TDPS'))
+
+patient_mono_time <- patient_mono_time %>%
+  mutate(
+    gap_over_60 = if_else(is.na(gap_over_60), 0, as.numeric(gap_over_60))
+  )
+
+
+
+
+
+patient_mono_time <- patient_mono_time %>%
+  mutate(
+    timeseries_index = case_when(
+      ICI_prescrib_TDPS == 1 ~ COHORT_START_DATE,
+      ICI_prescrib_TDPS == 2 ~ COHORT_START_DATE + 30,
+      ICI_prescrib_TDPS == 3 ~ COHORT_START_DATE + 60,
+      ICI_prescrib_TDPS == 4 ~ COHORT_START_DATE + 120,
+      ICI_prescrib_TDPS == 5 ~ COHORT_START_DATE + 180,
+      ICI_prescrib_TDPS == 6 ~ COHORT_START_DATE + 270,
+      ICI_prescrib_TDPS == 7 ~ COHORT_START_DATE + 365,
+      ICI_prescrib_TDPS == 8 ~ COHORT_START_DATE + 545,
+      ICI_prescrib_TDPS == 9 ~ COHORT_START_DATE + 730,
+    ))
+
+
+
+
+
+# irAE covariates 추가 241002
+irAE_total <- left_join(irAE_total, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+irAE <- irAE_total %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_irAE_days = as.numeric(difftime(CONDITION_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+irAE <- irAE %>%
+  mutate(
+    irAE_occur = case_when(
+      Index_irAE_days >= -365 & Index_irAE_days < 0 ~ 1,
+      Index_irAE_days >= 0 & Index_irAE_days < 30 ~ 2,
+      Index_irAE_days >= 30 & Index_irAE_days < 60 ~ 3,
+      Index_irAE_days >= 60 & Index_irAE_days < 120 ~ 4,
+      Index_irAE_days >= 120 & Index_irAE_days < 180 ~ 5,
+      Index_irAE_days >= 180 & Index_irAE_days < 270 ~ 6,
+      Index_irAE_days >= 270 & Index_irAE_days < 365 ~ 7,
+      Index_irAE_days >= 365 & Index_irAE_days < 545 ~ 8,
+      Index_irAE_days >= 545 & Index_irAE_days < 730 ~ 9
+    )
+  )
+irAE <- irAE %>%
+  group_by(PERSON_ID, irAE_occur) %>%
+  filter(CONDITION_START_DATE == max(CONDITION_START_DATE)) %>%
+  ungroup()
+irAE <- irAE %>%
+  group_by(PERSON_ID) %>%
+  filter(irAE_occur == min(irAE_occur)) %>%
+  ungroup()
+irAE <- irAE %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+irAE <- na.omit(irAE, subset = "irAE_occur")
+patient_mono_time <- left_join(patient_mono_time, select(irAE, c('PERSON_ID', 'irAE_occur')), by = 'PERSON_ID')
+
+patient_mono_time <- patient_mono_time %>%
+  mutate(irAE = if_else(is.na(irAE_occur),
+                          0,
+                          if_else(irAE_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time <- select(patient_mono_time, -irAE_occur)
+
+
+
+##250318 15일 이전 입원여부
+admission_raw <- read.csv("addmission.CSV")[,-1]
+ER_raw <- read.csv("ER.CSV")[,-1]
+
+colnames(admission_raw)
+colnames(ER_raw)
+
+admission <- select(admission_raw, PERSON_ID, VISIT_START_DATE)
+ER <- select(ER_raw, PERSON_ID, VISIT_START_DATE)
+
+hospital <- rbind(admission, ER)
+hospital <- unique(hospital)
+
+
+hospital <- left_join(hospital, select(patient, c(PERSON_ID, COHORT_START_DATE)), by = 'PERSON_ID')
+
+hospital <- hospital %>%
+  group_by(PERSON_ID) %>%
+    mutate(
+      COHORT_START_DATE = as.Date(COHORT_START_DATE)
+    ) %>%
+    mutate(
+      Index_hosp_days = as.numeric(difftime(VISIT_START_DATE, COHORT_START_DATE, units = "days")+1)
+    ) %>%
+    ungroup()
+
+hospital <- hospital %>%
+  mutate(
+    hospital_occur = case_when(
+      Index_hosp_days > -15 & Index_hosp_days <= 0 ~ 1,
+      Index_hosp_days > 15 & Index_hosp_days <= 30 ~ 2,
+      Index_hosp_days > 45 & Index_hosp_days <= 60 ~ 3,
+      Index_hosp_days > 105 & Index_hosp_days <= 120 ~ 4,
+      Index_hosp_days > 165 & Index_hosp_days <= 180 ~ 5,
+      Index_hosp_days > 255 & Index_hosp_days <= 270 ~ 6,
+      Index_hosp_days > 350 & Index_hosp_days <= 365 ~ 7,
+      Index_hosp_days > 530 & Index_hosp_days <= 545 ~ 8,
+      Index_hosp_days > 715 & Index_hosp_days <= 730 ~ 9
+    )
+  )
+
+hospital <- hospital %>%
+  group_by(PERSON_ID, hospital_occur) %>%
+  filter(VISIT_START_DATE == max(VISIT_START_DATE)) %>%
+  ungroup()
+
+hospital$ICI_prescrib_TDPS <- hospital$hospital_occur
+
+hospital <- hospital %>%
+  distinct(PERSON_ID, hospital_occur, .keep_all = TRUE)
+
+hospital <- na.omit(hospital, subset = "hospital_occur")
+
+
+patient_mono_time <- left_join(patient_mono_time, select(hospital, c('PERSON_ID', 'hospital_occur','ICI_prescrib_TDPS')), by = c('PERSON_ID','ICI_prescrib_TDPS'))
+patient_mono_time <- patient_mono_time %>%
+  mutate(hospital_sever = if_else(is.na(hospital_occur), 
+                          0, 
+                          1))
+patient_mono_time <- select(patient_mono_time, -hospital_occur)
+
+
+
+
+write.csv(patient_mono_time, file = "patient_mono_time_sens_sever_250318.CSV")
+
+
+
+```
+
+
+
+
+
+Time-dependent PS matching
+
+```{r}
+
+#----------------------BMI / ANC / NLR / cytokeratin 범주형으로 변환할 것인지?
+
+
+# 결측치 30% 이상인 변수 제외 
+missing_percentages <- colSums(is.na(patient_mono_time)) / nrow(patient_mono_time) * 100
+print(missing_percentages)
+
+
+#NA 처리 imputation
+patient_mono_time <- patient_mono_time %>%
+  group_by(PERSON_ID) %>%
+  mutate(ANC_lab = ifelse(is.na(ANC_lab), mean(ANC_lab, na.rm = TRUE), ANC_lab),
+         NLR_cal = ifelse(is.na(NLR_cal), mean(NLR_cal, na.rm = TRUE), NLR_cal)) %>%
+  ungroup()
+
+## weight imputation
+patient_mono_time <- patient_mono_time %>%
+  group_by(PERSON_ID) %>%
+  mutate(weight = ifelse(is.na(weight), mean(weight, na.rm = TRUE), weight)) %>%
+  ungroup()
+
+
+
+
+# ANC, NLR 범주형 처리
+patient_mono_time <- patient_mono_time %>%
+  mutate(ANC_category = case_when(
+    ANC_lab < 1500 ~ 1,
+    ANC_lab >= 1500 & ANC_lab <= 8000 ~ 2,
+    ANC_lab > 8000 ~ 3
+  ))
+
+# NLR_cal 범주화
+patient_mono_time <- patient_mono_time %>%
+  mutate(NLR_category = case_when(
+    NLR_cal < 3 ~ 1,
+    NLR_cal >= 3 & NLR_cal <= 5 ~ 2,
+    NLR_cal > 5 ~ 3
+  ))
+
+
+
+patient_mono_time_8 <- patient_mono_time %>% filter(is.na(ad_steroid) | ad_steroid != 9)
+print(TARcheck <- patient_mono_time_8 %>% filter(TARGET==1) %>% summarise(count = n_distinct(PERSON_ID)))
+
+
+
+library("tableone")
+
+
+colnames(patient_mono_time_8)
+
+
+patient_mono_time_ps <- select(patient_mono_time_8, PERSON_ID, ICI_prescrib_TDPS, ad_steroid, age, sex, squamouslc, durvalumab_use, ANC_category, NLR_category, AUTOIMMUNE, LIVER_INSUFFICIENCY, RENAL_INSUFFICIENCY, COPD, metastasis, RT_GKS, pre_chemo, pre_TKI_ALK, pre_steroid, ANTI_BIOTICS, NSAID, PPI, ACEI, OPIOID, irAE, Sepsis, hospital_sever)
+
+
+
+# install.packages("rsmatch")
+# install.packages("survival")
+# install.packages("nbpMatching")
+library("rsmatch")
+library("survival")
+library("nbpMatching")
+
+
+
+str(patient_mono_time_ps)
+missing_percentages <- colSums(is.na(patient_mono_time_ps)) / nrow(patient_mono_time_ps) * 100
+print(missing_percentages)
+
+
+
+patient_mono_time_ps <- patient_mono_time_ps %>%
+  mutate(sex = as.factor(sex))
+colnames(patient_mono_time_ps)
+
+
+
+
+patient_mono_time_pair <- coxpsmatch(
+  n_pairs = 10000,
+  data = patient_mono_time_ps,
+  id = "PERSON_ID",
+  time = "ICI_prescrib_TDPS",
+  trt_time = "ad_steroid",
+  covariates = c("metastasis", "RT_GKS", "age", "sex", "ANC_category", "NLR_category", "AUTOIMMUNE", "LIVER_INSUFFICIENCY", "RENAL_INSUFFICIENCY", "COPD", "pre_chemo", "pre_TKI_ALK", "pre_steroid", "ANTI_BIOTICS", "NSAID", "PPI", "ACEI", "OPIOID", "irAE", "squamouslc", "durvalumab_use", "Sepsis", "hospital_sever"),
+  exact_match = NULL,
+  options = list(time_lag = FALSE)
+)
+
+
+
+patient_mono_time_pair_filt <- patient_mono_time_pair %>%
+  filter(!is.na(type))
+
+patient_mono_time_pair_filt <- patient_mono_time_pair_filt %>%
+  arrange(pair_id)
+
+patient_mono_time_ps <- left_join(patient_mono_time_pair_filt, patient_mono_time, by ="PERSON_ID")
+
+
+
+
+
+# index date matching
+patient_mono_time_ps <- patient_mono_time_ps %>%
+  group_by(pair_id) %>%
+  mutate(
+    index = if (any(type == "trt")) first(ad_steroid[type == "trt"], default = NA) else NA,
+    index_fu = case_when(
+      type == "trt" & ICI_prescrib_TDPS == index ~ as.character(timeseries_index),
+      type == "all" & ICI_prescrib_TDPS == index ~ as.character(timeseries_index),
+      type == "all" & !any(ICI_prescrib_TDPS == index) ~ "Exclusion",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ungroup() %>%
+  select(-index)
+
+
+# pair-wise exclusion
+# 1) index_date가 매칭되지 않는 경우 삭제
+exclusion_rows <- patient_mono_time_ps %>%
+  filter(index_fu == "Exclusion")
+print(exclusion_rows)
+
+
+check <- patient_mono_time_ps %>%
+  filter((type == "all" & TARGET != 0) | (type == "trt" & TARGET != 1))
+print(check)
+
+
+# 2) 새롭게 Index "시점"에 ICI monotherapy가 아닌 경우 제외
+invalid_pair_ids <- patient_mono_time_ps %>%
+  filter(other_CA_START_DATE <= index_fu) %>%
+  pull(pair_id)
+
+print(invalid_pair_ids)
+
+
+patient_mono_time_ps_pex <- patient_mono_time_ps %>%
+  filter(!pair_id %in% invalid_pair_ids)
+
+
+unique(patient_mono_time_ps_pex$PERSON_ID)
+
+
+write.csv(patient_mono_time_ps, file = "patient_mono_time_ps_sens_sever_250318.CSV")
+write.csv(patient_mono_time_ps_pex, file = "patient_mono_time_pex_sens_sever_250318.CSV")
+
+
+
+
+
+
+library("tableone")
+
+
+#---------------------------------------------누적 변수로 변경 Dyspnea, Radiotherapy, Whole_Brain_RT, RTsurgery, gap_over_60
+
+
+patient_mono_time_ps_demo <- patient_mono_time_ps_pex
+
+
+
+colnames(patient_mono_time_ps_demo)
+
+
+# Dyspnea
+dyspnea <- dyspnea %>%
+  group_by(PERSON_ID) %>%
+  filter(dyspnea_occur == min(dyspnea_occur)) %>%
+  ungroup()
+
+dyspnea <- dyspnea %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+
+dyspnea <- na.omit(dyspnea, subset = "dyspnea_occur")
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(dyspnea, c('PERSON_ID', 'dyspnea_occur')), by = 'PERSON_ID')
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(Dyspnea = if_else(is.na(dyspnea_occur), 
+                          0, 
+                          if_else(dyspnea_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time_ps_demo <- select(patient_mono_time_ps_demo, -dyspnea_occur)
+patient_mono_time_ps_demo <- unique(patient_mono_time_ps_demo)
+
+
+# RT_GKS
+RT_GKS <- RT_GKS %>%
+  group_by(PERSON_ID) %>%
+  filter(RT_occur == min(RT_occur)) %>%
+  ungroup()
+
+RT_GKS <- RT_GKS %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+
+RT_GKS <- na.omit(RT_GKS, subset = "RT_occur")
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(RT_GKS, c('PERSON_ID', 'RT_occur')), by = 'PERSON_ID')
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(RT_GKS = if_else(is.na(RT_occur), 
+                          0, 
+                          if_else(RT_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time_ps_demo <- select(patient_mono_time_ps_demo, -RT_occur)
+
+
+
+
+# gap_over_60
+
+ICI_period$gap_occur <- ICI_period$ICI_prescrib_TDPS
+
+ICI_period <- ICI_period %>%
+  group_by(PERSON_ID) %>%
+  filter(gap_occur == min(gap_occur)) %>%
+  ungroup()
+
+ICI_period <- ICI_period %>%
+  distinct(PERSON_ID, .keep_all = TRUE)
+
+ICI_period <- na.omit(ICI_period, subset = "gap_occur")
+
+patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(ICI_period, c('PERSON_ID', 'gap_occur')), by = 'PERSON_ID')
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(gap_over_60 = if_else(is.na(gap_occur), 
+                          0, 
+                          if_else(gap_occur <= ICI_prescrib_TDPS, 1, 0)))
+patient_mono_time_ps_demo <- select(patient_mono_time_ps_demo, -gap_occur)
+
+patient_mono_time_ps_demo <- unique(patient_mono_time_ps_demo)
+
+
+
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  filter(!is.na(index_fu))
+
+colnames(patient_mono_time_ps_demo)
+
+patient_mono_time_ps_demo <- unique(patient_mono_time_ps_demo)
+
+str(patient_mono_time_ps_demo)
+
+
+write.csv(patient_mono_time_ps_demo, file = "patient_mono_time_ps_demo_sens_sever_250318.CSV")
+
+
+patient_mono_time_ps_demo <- select(patient_mono_time_ps_demo, -c("index_fu", "COHORT_START_DATE", "COHORT_END_DATE", "Steroid_index_date", "other_CA_START_DATE", "timeseries_index"))
+
+factorVars <- colnames(select(patient_mono_time_ps_demo, other_CA, pembrolizumab_use, nivolumab_use, atezolizumab_use, durvalumab_use, ICI_dupl, squamouslc, sex, AUTOIMMUNE, LIVER_INSUFFICIENCY, RENAL_INSUFFICIENCY, COPD, ANTI_BIOTICS, NSAID, PPI, ACEI, OPIOID, pre_steroid, pre_chemo, pre_TKI_ALK, ICI_prescrib_TDPS, ad_steroid, Sepsis, Pneumonitis, Dyspnea, RT_GKS, Brainmeta, Bonemeta, Livermeta, metastasis, gap_over_60, ANC_category, NLR_category, irAE, hospital_sever))
+
+table2 <- CreateTableOne(factorVars = factorVars,
+                         data = patient_mono_time_ps_demo,
+                         strata = 'TARGET',)
+
+
+table2 <- as.data.frame(print(table2, quote = FALSE, noSpaces = TRUE))
+write.csv(table2, file = "table2_sens_sever.CSV")
+
+
+
+```
+
+
+
+
+## 2024.10.04. PSM 결과 확인
+```{r}
+
+table2_clean <- read.csv("table2_clean_final.CSV")
+
+
+calculate_smd <- function(data, var_name, group_name){
+  TARGET <- data[[var_name]][data[[group_name]]==1]
+  CONTROL <- data[[var_name]][data[[group_name]]==0]
+  
+  mean_target <- mean(TARGET, na.rm = TRUE)
+  mean_control <- mean(CONTROL, na.rm = TRUE)
+  sd_target <- sd(TARGET, na.rm = TRUE)
+  sd_control <- sd(CONTROL, na.rm = TRUE)
+  smd <- (mean_target - mean_control)/ sqrt((sd_target^2+sd_control^2)/2)
+  return(smd)
+}
+
+str(patient_mono_time_ps_demo)
+patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
+  mutate(sex = ifelse(sex == "M", 1, ifelse(sex == "F", 0, NA)))
+
+smd_vars <- ls(pattern = "^smd_")
+smd_list <- mget(smd_vars)
+smd_df <- data.frame(variable = smd_vars, value = unlist(smd_list))
+
+
+write.csv(smd_df, file = "smd_final_PSM_sens_sever_250318.CSV")
+
+
+
+
+```
+
+
+
+
+
