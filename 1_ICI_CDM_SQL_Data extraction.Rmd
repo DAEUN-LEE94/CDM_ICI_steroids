@@ -3,13 +3,13 @@ title: "ICI_CDM_SQL_Data extraction"
 
 ---
 
-** CDM database 연결
+** Connect to the CDM database
 ```{r}
 dbExecute(con, "ROLLBACK;")
 library(DBI)
 library(RSQLite)
 library(DatabaseConnector)
-pathToDriver <- "D:/"
+pathToDriver <- "/path/to/driver"
 connectionDetails <- DatabaseConnector::createConnectionDetails()
 
 ```
@@ -17,39 +17,37 @@ connectionDetails <- DatabaseConnector::createConnectionDetails()
 
 
 
-0. Atlas에서 구축한 cohort 데이터 불러들이고, target/comp ID로 저장
+0. Import the cohort generated in ATLAS and store target/comparison IDs
 
 ```{r}
 library(dplyr)
 
 query0 <- "select *
-from public.SNUH5ICIentry_0822"
+from public.study_cohort"
 
 patient <- querySql(con, query0)
 patient <- select(patient, SUBJECT_ID, COHORT_START_DATE, COHORT_END_DATE)
 colnames(patient) <- c("PERSON_ID", "COHORT_START_DATE", "COHORT_END_DATE")
 
-setwd("D:/SNUH_OJM")
-
+setwd("/analysis/output")
 write.csv(patient, file = "patient.CSV")
 
 ```
 
 
-0. 암등록자료 
+0. Cancer registry data 
 ```{r}
 library(dplyr)
 
-
-# 항목 선별: 4160340 분화도 / 4219603 tnmstaging / 4299435 metacode / 3031228 summary staging
+# Selected items: 4160340 (differentiation) / 4219603 (TNM staging) / 4299435 (metastasis code) / 3031228 (summary staging)
 
 query_check <- "SELECT *
 FROM
-    cdm2024.observation o
+    cdm2025.observation o
 INNER JOIN
-    cdm2024.concept_ancestor ca ON o.observation_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON o.observation_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     o.person_id = cohort.subject_id
 WHERE
@@ -62,7 +60,7 @@ cancer_regist <- querySql(con, query_check)
 check <- unique(cancer_regist$PERSON_ID)
 
 
-setwd("D:/SNUH_OJM")
+setwd("/analysis/output")
 write.csv(cancer_regist, file = "cancer_regist.CSV")
 
 cancer_regist <- select(cancer_regist, PERSON_ID, OBSERVATION_CONCEPT_ID, VALUE_AS_STRING, OBSERVATION_SOURCE_VALUE)
@@ -77,7 +75,7 @@ cancer_reg_final <- left_join(cancer_reg_final, cancer_reg4, by = "PERSON_ID")
 cancer_reg_final <- unique(cancer_reg_final)
 
 
-setwd("D:/SNUH_OJM")
+setwd("/analysis/output")
 write.csv(cancer_reg_final, file = "cancer_reg_final.CSV")
 ```
 
@@ -87,11 +85,11 @@ write.csv(cancer_reg_final, file = "cancer_reg_final.CSV")
 
 query_lung <- "SELECT *
 FROM
-    cdm2024.condition_occurrence co
+    cdm2025.condition_occurrence co
 INNER JOIN
-    cdm2024.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     co.person_id = cohort.subject_id
 WHERE
@@ -102,7 +100,7 @@ WHERE
 cancer_lung <- querySql(con, query_lung)
 cancer_lung <- unique(cancer_lung)
 
-# 4110591: 제외한 컨셉 small cell lung cancer
+# 4110591: exclude small cell lung cancer concept
 cancer_lung <- cancer_lung %>% 
   filter(CONDITION_CONCEPT_ID != 4110591)
 
@@ -112,24 +110,22 @@ cancer_lung_sq <- cancer_lung %>%
 
 
 
-setwd("D:/SNUH_OJM")
+setwd("/analysis/output")
 write.csv(cancer_lung, file = "cancer_lung.CSV")
 write.csv(cancer_lung_sq, file = "cancer_lung_sq.CSV")
 ```
 
 
-# 다른 원발암 데이터 필요한가?
-# 다른 metastasis 
 ```{r}
 
 
 query_cancer <- "SELECT *
 FROM
-    cdm2024.condition_occurrence co
+    cdm2025.condition_occurrence co
 INNER JOIN
-    cdm2024.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     co.person_id = cohort.subject_id
 WHERE
@@ -139,7 +135,7 @@ WHERE
 
 cancer_primary <- querySql(con, query_cancer)
 
-setwd("D:/SNUH_OJM")
+setwd("/analysis/output")
 write.csv(cancer_primary, file = "cancer_primary.CSV")
 ```
 
@@ -147,17 +143,17 @@ write.csv(cancer_primary, file = "cancer_primary.CSV")
 
 
 
-1. 코호트 내 subject_id에 스테로이드 exposure 데이터 left join
+1. Left join steroid exposure data for cohort subjects
 ```{r}
 # Steroid exposure
 query1 <- "
 SELECT *
 FROM
-    cdm2024.drug_exposure de
+    cdm2025.drug_exposure de
 INNER JOIN
-    cdm2024.concept_ancestor ca ON de.drug_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON de.drug_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     de.person_id = cohort.subject_id
 WHERE
@@ -168,7 +164,7 @@ WHERE
 steroid <- querySql(con, query1)
 steroid <- unique(steroid)
 
-# #fludrocortisone acetate 제외
+# #fludrocortisone acetate can be excluded if necessary
 # steroid <- steroid %>% filter(
 #   DRUG_CONCEPT_ID != "1555142"
 # )
@@ -185,17 +181,17 @@ write.csv(steroid_concept,file = "steroid_concept.CSV")
 
 
 
-2. ICI exposure 붙이기
+2. Append ICI exposure
 ```{r}
 
 query2 <- "
 SELECT *
 FROM
-    cdm2024.drug_exposure de
+    cdm2025.drug_exposure de
 INNER JOIN
-    cdm2024.concept_ancestor ca ON de.drug_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON de.drug_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     de.person_id = cohort.subject_id
 WHERE
@@ -229,11 +225,11 @@ write.csv(ICI_durva,file = "ICI_durva.CSV")
 query2_2 <- "
 SELECT *
 FROM
-    cdm2024.drug_exposure de
+    cdm2025.drug_exposure de
 INNER JOIN
-    cdm2024.concept_ancestor ca ON de.drug_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON de.drug_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     de.person_id = cohort.subject_id
 WHERE
@@ -247,19 +243,16 @@ TKI_ALK <- unique(TKI_ALK)
 ```
 
 
-
-2023 SNUH CDM schemas에서 불러올 column명
-
-3. death table: death_date 불러오기
+3. death table: death_date 
 ```{r}
 query3 <- "
 SELECT
     cohort.subject_id,
     d.death_date
 FROM
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 LEFT JOIN
-    cdm2024.death d ON cohort.subject_id = d.person_id
+    cdm2025.death d ON cohort.subject_id = d.person_id
 "
 death <- querySql(con, query3)
 colnames(death) <- c("PERSON_ID", "DEATH_DATE")
@@ -268,8 +261,8 @@ death <- unique(death)
 ```
 
 
-4. person: gender_concept_id/year_of_birth/month_of_birth 불러오기
-# 	8507 가 남자
+4. person: gender_concept_id/year_of_birth/month_of_birth 
+# 	8507 male
 
 ```{r}
 query4 <- "
@@ -279,9 +272,9 @@ SELECT
     p.year_of_birth,
     p.month_of_birth
 FROM
-    public.SNUH5ICIentry_0822 cohort
+    public.study_cohort cohort
 LEFT JOIN
-    cdm2024.person p ON cohort.subject_id = p.person_id
+    cdm2025.person p ON cohort.subject_id = p.person_id
 "
 sexbirth <- querySql(con, query4)
 colnames(sexbirth) <- c("PERSON_ID", "GENDER_CONCEPT_ID", "YEAR_OF_BIRTH", "MONTH_OF_BIRTH")
@@ -293,7 +286,7 @@ sexbirth <- unique(sexbirth)
 
 
 
-5. ER 방문 불러오기
+5. Retrieve emergency room visits
 
 ```{r}
 
@@ -302,9 +295,9 @@ SELECT
     cohort.subject_id,
     v.*
 FROM
-    cdm2024.visit_occurrence v
+    cdm2025.visit_occurrence v
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     v.person_id = cohort.subject_id
 WHERE
@@ -316,9 +309,8 @@ ER <- querySql(con, query5)
 
 
 
-6. ICU & 일반 입원 불러오기
-** 서울대병원에는 ICU 매핑되어 있지 않아서 생략 및 일반입원으로 대체하였음.
-다른 병원에서는 추가 필요
+
+6. Retrieve inpatient visits
 
 ```{r}
 query6 <- "
@@ -326,9 +318,9 @@ SELECT
     cohort.subject_id,
     v.*
 FROM
-    cdm2024.visit_occurrence v
+    cdm2025.visit_occurrence v
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     v.person_id = cohort.subject_id
 WHERE
@@ -341,26 +333,17 @@ addmission <- querySql(con, query6)
 
 
 
--- 아래 sql 코드는 cdm 내 매핑되어 있는 컨셉 조회할 때 쓰는 코드		
-select * from cdm.concept limit 190
-select * from cdm.source_to_concept_map where snuh_id similar to 'L20%' 
-
-select * from cdm.concept
-where lower(concept_name) similar to '%neutrophil count%'
-and domain_id = 'Measurement'
-
-
-8. 병용약제 불러오기: 6개월 이내
-# 쿼리는 SQL로 돌린 후에 결과 테이블만 불러왔음. 환자당 아무레코드도 없는 경우는 ICI 사용 30일 전에 병용약물 카운트 안된 것.
+8. Retrieve concomitant medications within 6 months
+# Run the SQL separately and import only the result table. If a participant has no records, no concomitant medications were counted within 30 days before ICI initiation.
 ```{r}
 
-# 변경된 병용약제 목록 (5/20)
+
 query8_1 <-"
 SELECT c.subject_id AS person_id,
     MAX(CASE
         WHEN de.drug_concept_id IN
             (SELECT descendant_concept_id
-             FROM cdm2024.concept_ancestor
+             FROM cdm2025.concept_ancestor
              WHERE ancestor_concept_id IN (21602796))
         THEN 1
         ELSE 0
@@ -368,7 +351,7 @@ SELECT c.subject_id AS person_id,
     MAX(CASE
         WHEN de.drug_concept_id IN
             (SELECT descendant_concept_id
-             FROM cdm2024.concept_ancestor
+             FROM cdm2025.concept_ancestor
              WHERE ancestor_concept_id IN (21603933))
         THEN 1
         ELSE 0
@@ -376,7 +359,7 @@ SELECT c.subject_id AS person_id,
     MAX(CASE
         WHEN de.drug_concept_id IN
             (SELECT descendant_concept_id
-             FROM cdm2024.concept_ancestor
+             FROM cdm2025.concept_ancestor
              WHERE ancestor_concept_id IN (21600095))
         THEN 1
         ELSE 0
@@ -384,7 +367,7 @@ SELECT c.subject_id AS person_id,
     MAX(CASE
         WHEN de.drug_concept_id IN
             (SELECT descendant_concept_id
-             FROM cdm2024.concept_ancestor
+             FROM cdm2025.concept_ancestor
              WHERE ancestor_concept_id IN (21601782))
         THEN 1
         ELSE 0
@@ -392,13 +375,13 @@ SELECT c.subject_id AS person_id,
     MAX(CASE
         WHEN de.drug_concept_id IN
             (SELECT descendant_concept_id
-             FROM cdm2024.concept_ancestor
+             FROM cdm2025.concept_ancestor
              WHERE ancestor_concept_id IN (21604254))
         THEN 1
         ELSE 0
         END) AS opioid
-FROM cdm2024.drug_exposure de
-INNER JOIN public.SNUH5ICIentry_0822 c ON de.person_id = c.subject_id
+FROM cdm2025.drug_exposure de
+INNER JOIN public.study_cohort c ON de.person_id = c.subject_id
 AND de.drug_exposure_start_date >= c.cohort_start_date - INTERVAL '180 days'
 AND de.drug_exposure_start_date < c.cohort_start_date
 GROUP BY c.subject_id
@@ -408,21 +391,17 @@ concom_drug2 <- unique(concom_drug2)
 
 ```
 
-## Smoking: 우리 코호트 내에 없었음
+## Smoking
 ```{r}
-
-# 43055140	72513-5	Vital signs with smoking status and pain scale [VSP]	Survey	0	451,084,834	Observation	LOINC
-# 1177395	LG50107-8	Smoking - biochemical markers	LOINC Group	0	56,594	Measurement	LOINC
-# 1177408	LG50111-0	Smoking biochemical markers	LOINC Group	0	56,594	Measurement	LOINC
 
 query8_9 <-"
 SELECT *
 FROM
-    cdm2024.observation po
+    cdm2025.observation po
 INNER JOIN
-    cdm2024.concept_ancestor ca ON po.observation_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON po.observation_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     po.person_id = cohort.subject_id
 WHERE
@@ -431,18 +410,17 @@ WHERE
 "
 smoking_obser <- querySql(con, query8_9)
 smoking_obser <- unique(smoking_obser)
-## null data (2024.10.04.)
 
 
 
 query8_10 <-"
 SELECT *
 FROM
-    cdm2024.measurement po
+    cdm2025.measurement po
 INNER JOIN
-    cdm2024.concept_ancestor ca ON po.measurement_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON po.measurement_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     po.person_id = cohort.subject_id
 WHERE
@@ -453,7 +431,7 @@ smoking_measure <- querySql(con, query8_10)
 smoking_measure <- unique(smoking_measure)
 
 write.csv(smoking_measure, file = "smoking.CSV")
-## 일부 대상자 데이터 있으나 missing 너무 커서 제외 (2024.10.04.)
+
 
 ```
 
@@ -462,36 +440,18 @@ write.csv(smoking_measure, file = "smoking.CSV")
 
 
 
-9. 다른 항암제 사용: 기간 제한없이 모두(entry 시점의 다른 항암제 병용은 atlas entry 시 제외, index 이후 다른 항암제는 rwTOT 
-+ sensitivity analysis에서 2년이내 다른 항암제 사용 환자만 걸러냄=second-line 이상 monotherapy)
-
-35807304       Taxane                          
-35807315        Platinum agent                      
-1350504         etoposide   
-1367268	51499	irinotecan	Drug	Standard	
-
-1343346	39541	vinorelbine	Drug	Standard			
-19008264	11198	vinblastine	Drug	Standard			
-1304919	68446	pemetrexed	Drug	Standard		
-1314924	12574	gemcitabine	Drug	Standard			
-1338512	3639	doxorubicin	Drug	Standard
-
-# ALK inhibitor	35807229
-# Tyrosine kinase inhibitor	912198
-
-######### 2024-08-26 여기서부터 다시 데이터 추출하기: atlas 확인해서 bevacizumab 컨셉 추가 필요
-
+9. Other anticancer agents: include all regardless of timing (other agents at entry are excluded in ATLAS; post-index agents contribute to rwTOT). Sensitivity analysis filters patients with other anticancer agents within 2 years, representing second-line or later monotherapy.
 
 ```{r}
 
 query9 <- "
 SELECT *
 FROM
-    cdm2024.drug_exposure de
+    cdm2025.drug_exposure de
 INNER JOIN
-    cdm2024.concept_ancestor ca ON de.drug_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON de.drug_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
 ON
     de.person_id = cohort.subject_id
 WHERE
@@ -502,22 +462,22 @@ WHERE
 cancer_agent <- querySql(con, query9)
 cancer_agent <- unique(cancer_agent)
 
-
 ```
 
 
 
 
-10. 병존질환 불러오기: 1년 이내
-# 쿼리는 SQL로 돌린 후에 결과 테이블만 불러왔음. 환자당 아무레코드도 없는 경우는 ICI 사용 1년 전에 진단코드 없는 것
+10. Retrieve comorbid conditions within 1 year
+# Run the SQL separately and import only the result table. If a participant has no records, there were no diagnosis codes within 1 year before ICI initiation.
+
 ```{r}
 
 query10 <- "SELECT c.subject_id AS person_id,
     MAX(CASE WHEN co.condition_concept_id IN (192240,192675,194574,194692,196463,197654,198964,199867,200451,200763,201613,1199060,1200209,1200610,3183806,3185452,3654614,3654682,3654685,3655440,3655942,3656096,4003673,4009322,4009793,4012113,4026125,4026126,4046016,4046017,4046123,4048057,4048083,4049282,4049419,4050640,4053079,4055209,4055210,4055211,4055212,4058680,4058681,4058682,4059284,4059285,4059287,4059289,4064161,4071022,4098583,4135822,4140536,4141628,4143008,4144116,4146181,4148254,4150383,4153294,4159158,4163687,4170063,4173584,4183882,4184779,4194229,4198610,4200888,4203601,4212540,4232466,4232955,4238508,4238978,4247138,4248427,4252074,4267417,4268006,4283078,4292401,4294539,4296554,4300060,4304584,4313567,4322067,4340385,4340392,4340393,4340394,4340946,4340948,4342774,4342775,4342776,4345477,35205239,35305727,35305798,35329466,35329468,35624866,35624867,35625040,35625139,35625140,35625141,35625295,35625296,35902858,35909522,35909523,35909524,35909525,35909526,35909527,35909528,35909529,35909530,35944247,35944248,35944250,35944252,35944253,35944254,35944255,35944257,35944258,35944260,35944261,35944262,35944264,35944267,35944268,35944269,35944270,35944272,35944273,35944274,35944275,35944276,35944277,35944278,36674397,36674996,36676898,36686081,36687200,36715922,36716035,37017009,37017151,37017654,37110890,37111265,37111266,37117933,37396157,37396401,37397143,37399445,42536529,42537672,42539566,42872885,42889487,42890748,42890749,42891930,43011220,43531723,44783142,44805713,45766656,45769525,45772057,45773146,45885814,46273476,46276562) THEN 1 ELSE 0 END) AS liver_insufficiency,
     MAX(CASE WHEN co.condition_concept_id IN (443597,443611,443612,760850,762001,762033,762034,765536,36716945,36716946,36716947,37017813,37018761,37019193,43020437,43020456,43020457,43021835,43531562,43531577,43531653,44782689,44782690,44782691,44784638,44784639,44792230,44792231,44792232,44792249,44792250,44792251,44792252,44792253,44792254,44792255,45757444,45757445,45757446,45763854,45763855,45769902,45769903,45771075,46270356,46273514,46273636,46284587,46284588,46284591,46284592,46284593,46284597,46284598,46284599,46284600,46284602,46284603,46286992) THEN 1 ELSE 0 END) AS renal_insufficiency,
     MAX(CASE WHEN co.condition_concept_id IN (255573,257004,259043,261325,261895,440748,789407,789516,3185549,3654571,3654836,3654837,4046986,4050732,4050733,4050734,4050961,4056405,4083395,4110048,4110056,4110635,4112828,4112836,4115044,4136683,4145496,4148124,4166508,4166517,4177944,4193588,4196712,4209097,4246105,4281815,4286497,4315386,4321845,37219804,37282519,37282523,37282524,37282525,37282526,37282530,37282531,37282532,37282533,42574216,42598711,42893697,43530693,44791725,44807895,45769389,46269701,46274062) THEN 1 ELSE 0 END) AS COPD
-FROM cdm2024.condition_occurrence co
-INNER JOIN public.SNUH5ICIentry_0822 c ON co.person_id = c.subject_id
+FROM cdm2025.condition_occurrence co
+INNER JOIN public.study_cohort c ON co.person_id = c.subject_id
 AND co.condition_start_date >= c.cohort_start_date - INTERVAL '365 days'
 AND co.condition_start_date < c.cohort_start_date
 GROUP BY c.subject_id"
@@ -529,7 +489,7 @@ comorbd_disease <- querySql(con, query10)
 
 
 
-11~14. 예후인자 불러오기: measurement table (TNM은 따로)
+11~14. Retrieve prognostic factors from the measurement table (TNM handled separately)
 
 
 ```{r}
@@ -538,15 +498,15 @@ query17 <- "
 with cte1 as
 (
 SELECT * 
-FROM cdm2024.measurement m
-INNER JOIN public.SNUH5ICIentry_0822 c ON m.person_id = c.subject_id
+FROM cdm2025.measurement m
+INNER JOIN public.study_cohort c ON m.person_id = c.subject_id
 WHERE
 m.measurement_concept_id IN (3013762, 3025315)
 AND m.measurement_date >= (c.cohort_start_date - INTERVAL '180 days')
 )
 select * from cte1 m
 INNER JOIN
-cdm2024.concept_ancestor ca ON m.measurement_concept_id=ca.descendant_concept_id
+cdm2025.concept_ancestor ca ON m.measurement_concept_id=ca.descendant_concept_id
 "
 weight <- querySql(con, query17)
 weight <- unique(weight)
@@ -560,8 +520,8 @@ query18 <- "
 with cte1 as
 (
 SELECT * 
-FROM cdm2024.measurement m
-INNER JOIN public.SNUH5ICIentry_0822 c ON m.person_id = c.subject_id
+FROM cdm2025.measurement m
+INNER JOIN public.study_cohort c ON m.person_id = c.subject_id
 WHERE
 m.measurement_concept_id IN (44816626, 3036277, 3015514)
 AND m.measurement_date >= (c.cohort_start_date - INTERVAL '180 days')
@@ -582,8 +542,8 @@ query13_2 <- "
 with cte1 as
 (
 SELECT * 
-FROM cdm2024.measurement m
-INNER JOIN public.SNUH5ICIentry_0822 c ON m.person_id = c.subject_id
+FROM cdm2025.measurement m
+INNER JOIN public.study_cohort c ON m.person_id = c.subject_id
 WHERE
 m.measurement_concept_id IN (3000659)
 AND m.measurement_date >= (c.cohort_start_date - INTERVAL '180 days')
@@ -603,8 +563,8 @@ query12 <- "
 with cte1 as
 (
 SELECT * 
-FROM cdm2024.measurement m
-INNER JOIN public.SNUH5ICIentry_0822 c ON m.person_id = c.subject_id
+FROM cdm2025.measurement m
+INNER JOIN public.study_cohort c ON m.person_id = c.subject_id
 WHERE
 m.measurement_concept_id IN (3013650, 3037511, 3017354, 9032)
 AND m.measurement_date >= (c.cohort_start_date - INTERVAL '180 days')
@@ -630,9 +590,6 @@ write.csv(CBC_lab, file="CBC_lab.CSV")
 
 15. Condition table
 
-(예후인자) 자가면역질환
-(하위그룹) 스테로이드사용 적응증 / brain Meta
-
 ```{r}
 
 query15 <- "
@@ -640,13 +597,13 @@ SELECT c.subject_id AS person_id,
     MAX(CASE 
         WHEN co.condition_concept_id IN 
             (SELECT descendant_concept_id 
-             FROM cdm2024.concept_ancestor 
+             FROM cdm2025.concept_ancestor 
              WHERE ancestor_concept_id IN (434621, 200762, 81893, 40482865, 4116142, 40479837, 35708063, 201606, 37111373, 4116143, 46269890, 46269889, 195575, 195585, 194684, 4264850, 4246693, 35708073, 4074815, 435503, 441269, 440979, 4219853, 4098018, 4155187, 28396, 4175331, 4198102, 4137430, 4301602))
         THEN 1 
         ELSE 0 
         END) AS autoimmune
-FROM cdm2024.condition_occurrence co
-INNER JOIN public.SNUH5ICIentry_0822 c ON co.person_id = c.subject_id
+FROM cdm2025.condition_occurrence co
+INNER JOIN public.study_cohort c ON co.person_id = c.subject_id
 AND co.condition_start_date >= c.cohort_start_date - INTERVAL '365 days'
 AND co.condition_start_date < c.cohort_start_date
 GROUP BY c.subject_id
@@ -664,11 +621,11 @@ SELECT
     co.condition_concept_id,
     co.condition_start_date
 FROM 
-    cdm2024.condition_occurrence co
+    cdm2025.condition_occurrence co
 INNER JOIN
-    cdm2024.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
   ON
     co.person_id = cohort.subject_id
 WHERE
@@ -689,11 +646,11 @@ SELECT
     co.condition_concept_id,
     co.condition_start_date
 FROM 
-    cdm2024.condition_occurrence co
+    cdm2025.condition_occurrence co
 INNER JOIN
-    cdm2024.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
   ON
     co.person_id = cohort.subject_id
 WHERE
@@ -710,11 +667,11 @@ SELECT
     co.condition_concept_id,
     co.condition_start_date
 FROM 
-    cdm2024.condition_occurrence co
+    cdm2025.condition_occurrence co
 INNER JOIN
-    cdm2024.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
   ON
     co.person_id = cohort.subject_id
 WHERE
@@ -735,11 +692,11 @@ SELECT
     co.condition_concept_id,
     co.condition_start_date
 FROM 
-    cdm2024.condition_occurrence co
+    cdm2025.condition_occurrence co
 INNER JOIN
-    cdm2024.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
   ON
     co.person_id = cohort.subject_id
 WHERE
@@ -755,8 +712,8 @@ SELECT DISTINCT
   co.person_id,
   co.condition_concept_id,
   co.condition_start_date
-FROM cdm2024.condition_occurrence co
-INNER JOIN public.SNUH5ICIentry_0822 c ON co.person_id = c.subject_id
+FROM cdm2025.condition_occurrence co
+INNER JOIN public.study_cohort c ON co.person_id = c.subject_id
 INNER JOIN
 cdm.concept_ancestor ca ON co.condition_concept_id=ca.descendant_concept_id
 WHERE
@@ -772,8 +729,8 @@ SELECT DISTINCT
   co.person_id,
   co.condition_concept_id,
   co.condition_start_date
-FROM cdm2024.condition_occurrence co
-INNER JOIN public.SNUH5ICIentry_0822 c ON co.person_id = c.subject_id
+FROM cdm2025.condition_occurrence co
+INNER JOIN public.study_cohort c ON co.person_id = c.subject_id
 INNER JOIN
 cdm.concept_ancestor ca ON co.condition_concept_id=ca.descendant_concept_id
 WHERE
@@ -790,8 +747,8 @@ SELECT DISTINCT
   co.person_id,
   co.condition_concept_id,
   co.condition_start_date
-FROM cdm2024.condition_occurrence co
-INNER JOIN public.SNUH5ICIentry_0822 c ON co.person_id = c.subject_id
+FROM cdm2025.condition_occurrence co
+INNER JOIN public.study_cohort c ON co.person_id = c.subject_id
 INNER JOIN
 cdm.concept_ancestor ca ON co.condition_concept_id=ca.descendant_concept_id
 WHERE
@@ -807,16 +764,15 @@ dyspnea <- unique(dyspnea)
 
 
 
-# irAE covariate 추가 _ 2024.05.31
-## Atlas 수정 시 (2024.09.27.)
+# irAE covariate
 
 query15_9 <- "
 SELECT DISTINCT
   co.person_id,
   co.condition_concept_id,
   co.condition_start_date
-FROM cdm2024.condition_occurrence co
-INNER JOIN public.SNUH5ICIentry_0822 c ON co.person_id = c.subject_id
+FROM cdm2025.condition_occurrence co
+INNER JOIN public.study_cohort c ON co.person_id = c.subject_id
 INNER JOIN
 cdm.concept_ancestor ca ON co.condition_concept_id=ca.descendant_concept_id
 WHERE
@@ -832,8 +788,8 @@ SELECT DISTINCT
   co.person_id,
   co.condition_concept_id,
   co.condition_start_date
-FROM cdm2024.condition_occurrence co
-INNER JOIN public.SNUH5ICIentry_0822 c ON co.person_id = c.subject_id
+FROM cdm2025.condition_occurrence co
+INNER JOIN public.study_cohort c ON co.person_id = c.subject_id
 INNER JOIN
 cdm.concept_ancestor ca ON co.condition_concept_id=ca.descendant_concept_id
 WHERE
@@ -851,10 +807,6 @@ write.csv(irAE_total, file = "irAE_total.CSV")
 
 print(unique(irAE_total$PERSON_ID))
 
-  
-
-##### irAE_total 데이터셋을 기준으로 concept_id로 R에서 subset 만들기
-
 
 #2. Thyrotoxicosis
 # Hypothyroidism	140673
@@ -866,8 +818,8 @@ print(unique(irAE_total$PERSON_ID))
 
 query15_15 <- "
 select c.concept_name, c.concept_id
-  from cdm2024.CONCEPT c
-  join cdm2024.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
+  from cdm2025.CONCEPT c
+  join cdm2025.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
   and ca.ancestor_concept_id in (140673, 4142479, 45586131, 138387, 4130020, 133737)
 "
 Thyrotoxicosis_con <- querySql(con, query15_15)
@@ -886,8 +838,8 @@ Thyrotoxicosis <- irAE_total %>%
 
 query15_16 <- "
 select c.concept_name, c.concept_id
-  from cdm2024.CONCEPT c
-  join cdm2024.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
+  from cdm2025.CONCEPT c
+  join cdm2025.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
   and ca.ancestor_concept_id in (321319, 314383, 312437)
 "
 Cardiomyopathy <- querySql(con, query15_16)
@@ -910,8 +862,8 @@ Cardiomyopathy <- irAE_total %>%
 
 query15_17 <- "
 select c.concept_name, c.concept_id
-  from cdm2024.CONCEPT c
-  join cdm2024.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
+  from cdm2025.CONCEPT c
+  join cdm2025.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
   and ca.ancestor_concept_id in (45562541, 139900, 37303807, 45553721, 45533641, 37320205, 4302654, 45596376)
 "
 Dermatotx <- querySql(con, query15_17)
@@ -929,8 +881,8 @@ Dermatotx <- irAE_total %>%
 
 query15_18 <- "
 select c.concept_name, c.concept_id
-  from cdm2024.CONCEPT c
-  join cdm2024.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
+  from cdm2025.CONCEPT c
+  join cdm2025.CONCEPT_ANCESTOR ca on c.concept_id = ca.descendant_concept_id
   and ca.ancestor_concept_id in (35702804, 35707714, 45548143, 45557681, 4340942, 45586742, 35909605, 45601188, 45591611)
 "
 pancrea_soma_heptitis <- querySql(con, query15_18)
@@ -949,10 +901,6 @@ write.csv(pancrea_soma_heptitis, file = "pancrea_soma_heptitis.CSV")
 
 16. procedure_occurrence table
 
-### CSC 정의 컨셉 포함: 구체적인 목록은 아틀라스 혹은 성모반입컨셉목록240919 확인 _24.09.27.
-
-(예후인자) EBRT	45949646 <= 서울대병원 maaping 0 *****
-(하위그룹) GKS & WBRT	4277939,44791440,44790307,44791428,40488986,764407,4021989,4199388,4244986,4198764
 
 ```{r}
 
@@ -964,11 +912,11 @@ SELECT
     co.condition_concept_id,
     co.condition_start_date
 FROM 
-    cdm2024.condition_occurrence co
+    cdm2025.condition_occurrence co
 INNER JOIN
-    cdm2024.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON co.condition_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
   ON
     co.person_id = cohort.subject_id
 WHERE
@@ -988,9 +936,9 @@ SELECT
 FROM 
     cdm.procedure_occurrence po
 INNER JOIN
-    cdm2024.concept_ancestor ca ON po.procedure_concept_id = ca.descendant_concept_id
+    cdm2025.concept_ancestor ca ON po.procedure_concept_id = ca.descendant_concept_id
 LEFT JOIN
-    (SELECT subject_id FROM public.SNUH5ICIentry_0822) cohort
+    (SELECT subject_id FROM public.study_cohort) cohort
   ON
     po.person_id = cohort.subject_id
 WHERE
@@ -1010,55 +958,4 @@ write.csv(CSC_RT_GKS, file="CSC_RT_GKS.CSV")
 
 
 
-
-```{r}
-
-setwd("D:/SNUH_OJM")
-
-write.csv(weight_s, file = "weight.CSV")
-write.csv(height_s, file = "height.CSV")
-write.csv(cytokeratin, file="cytokeratin.CSV")
-
-
-write.csv(addmission, file = "addmission.CSV")
-write.csv(autoimmunedz, file = "autoimmunedz.CSV")
-write.csv(cancer_agent, file = "cancer_agent.CSV")
-write.csv(CBC_lab, file = "CBC_lab.CSV")
-write.csv(cytokeratin, file="cytokeratin.CSV")
-write.csv(comorbd_disease, file = "comorbd_disease.CSV")
-write.csv(concom_drug2, file = "concom_drug2.CSV")
-write.csv(death, file = "death.CSV")
-write.csv(ER, file = "ER.CSV")
-write.csv(ICI, file = "ICI.CSV")
-write.csv(patient, file = "patient.CSV")
-write.csv(sexbirth, file = "sexbirth.CSV")
-write.csv(steroid, file = "steroid.CSV")
-# 
-# write.csv(RT, file = "RT.CSV")
-# write.csv(GKS_WBRT, file = "GKS_WBRT.CSV")
-write.csv(brainmeta, file = "brainmeta.CSV")
-write.csv(bonemeta, file = "bonemeta.CSV")
-write.csv(livermeta, file = "livermeta.CSV")
-
-write.csv(sepsis, file = "sepsis.CSV")
-write.csv(dyspnea, file = "dyspnea.CSV")
-write.csv(pneumonitis, file = "pneumonitis.CSV")
-# write.csv(TNM, file="TNM.CSV")
-write.csv(TKI_ALK, file = "TKI_ALK.CSV")
-
-
-write.csv(pneumonitis, file = "pneumonitis.CSV")
-write.csv(Thyrotoxicosis, file = "Thyrotoxicosis.CSV")
-write.csv(Cardiomyopathy, file = "Cardiomyopathy.CSV")
-write.csv(Dermatotx, file = "Dermatotx.CSV")
-# write.csv(pancreatitis, file = "pancreatitis.CSV")
-# write.csv(Encephalomyelitis, file = "Encephalomyelitis.CSV")
-
-
-
-
-# write.csv(imsi, file = "imsi.CSV")
-# check <- unique(TKI_ALK$PERSON_ID)
-
-```
 
