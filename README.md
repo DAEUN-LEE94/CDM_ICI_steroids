@@ -1,7 +1,7 @@
 # CDM_ICI_steroids
 R code for a multicenter target trial emulation assessing the causal impact of glucocorticoid timing and dose on survival in advanced NSCLC treated with immune checkpoint inhibitors using time-dependent propensity score matching and CDM-based real-world data.
 
-# Impact of Early and High-Dose Glucocorticoids on Survival in Advanced NSCLC Treated with Immune Checkpoint Inhibitors  
+# Early and High-Dose Glucocorticoid Use and Survival in Advanced NSCLC Receiving Immune Checkpoint Inhibitors
 ### A Multicenter Target Trial Emulation using CDM Data
 
 ---
