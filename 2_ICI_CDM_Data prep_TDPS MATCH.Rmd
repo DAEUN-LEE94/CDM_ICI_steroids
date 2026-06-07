@@ -1906,11 +1906,30 @@ patient_mono_time_ps <- patient_mono_time_ps %>%
   select(-index)
 
 
-# pair-wise exclusion
-#  1) Drop records where the index_date cannot be matched
-exclusion_rows <- patient_mono_time_ps %>%
-  filter(index_fu == "Exclusion")
-print(exclusion_rows)
+
+# index date matching
+patient_mono_time_ps <- patient_mono_time_ps %>%
+  group_by(pair_id) %>%
+  mutate(
+    index = if (any(type == "trt")) {
+      first(ad_steroid[type == "trt"], default = NA_real_)}
+    else {NA_real_},
+    N_days = first(
+      as.integer(as.Date(Steroid_index_date[type == "trt"]) - as.Date(COHORT_START_DATE[type == "trt"])),
+      default = NA_integer_
+    ),
+    
+    index_fu = case_when(
+      type == "trt" & ICI_prescrib_TDPS == index ~ as.character(Steroid_index_date),
+      type == "all" & ICI_prescrib_TDPS == index ~ as.character(as.Date(COHORT_START_DATE) + N_days),
+      type == "all" & !any(type == "all" & ICI_prescrib_TDPS == index, na.rm = TRUE) ~ "Exclusion",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ungroup()%>%
+  select(
+    -index
+  )
 
 
 check <- patient_mono_time_ps %>%
@@ -1992,31 +2011,6 @@ patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
                           if_else(RT_occur <= ICI_prescrib_TDPS, 1, 0)))
 patient_mono_time_ps_demo <- select(patient_mono_time_ps_demo, -RT_occur)
 
-
-
-
-# gap_over_60
-
-ICI_period$gap_occur <- ICI_period$ICI_prescrib_TDPS
-
-ICI_period <- ICI_period %>%
-  group_by(PERSON_ID) %>%
-  filter(gap_occur == min(gap_occur)) %>%
-  ungroup()
-
-ICI_period <- ICI_period %>%
-  distinct(PERSON_ID, .keep_all = TRUE)
-
-ICI_period <- na.omit(ICI_period, subset = "gap_occur")
-
-patient_mono_time_ps_demo <- left_join(patient_mono_time_ps_demo, select(ICI_period, c('PERSON_ID', 'gap_occur')), by = 'PERSON_ID')
-patient_mono_time_ps_demo <- patient_mono_time_ps_demo %>%
-  mutate(gap_over_60 = if_else(is.na(gap_occur), 
-                          0, 
-                          if_else(gap_occur <= ICI_prescrib_TDPS, 1, 0)))
-patient_mono_time_ps_demo <- select(patient_mono_time_ps_demo, -gap_occur)
-
-patient_mono_time_ps_demo <- unique(patient_mono_time_ps_demo)
 
 
 
